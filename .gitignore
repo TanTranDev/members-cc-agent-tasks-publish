@@ -1,0 +1,12 @@
+node_modules/
+*.log
+
+# Cấu hình + token của từng máy. KHÔNG BAO GIỜ commit.
+# Dùng `.env*` để phủ luôn các biến thể sinh ra sau này (.env.bak do `init --force` tạo,
+# .env.local, .env.production…) — mỗi file đó đều có thể chứa token.
+.env*
+# …trừ bản mẫu, file này PHẢI được commit vì nó là tài liệu cấu hình.
+!.env.example
+
+# Override riêng một clone (nếu đặt ngoài .git/)
+agent-tasks-local.json

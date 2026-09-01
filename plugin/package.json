@@ -1,0 +1,13 @@
+{
+  "name": "agent-tasks",
+  "version": "0.2.1",
+  "description": "MCP server + skill điều phối work item GitLab cho nhiều phiên agent. Đây là PLUGIN ROOT — Claude Code chạy `npm ci --ignore-scripts` ở đúng thư mục này.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}

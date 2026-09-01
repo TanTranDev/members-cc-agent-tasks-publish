@@ -1,0 +1,19 @@
+{
+  "name": "agent-tasks-marketplace",
+  "owner": {
+    "name": "nexa"
+  },
+  "metadata": {
+    "description": "Điều phối công việc cho nhiều phiên agent qua GitLab work items",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-tasks",
+      "source": "./plugin",
+      "description": "Chống trùng task giữa nhiều phiên agent bằng claim có TTL trên git refs, và trả lời được \"N ngày qua dự án đổi gì, vì sao\". 15 MCP tool + 7 skill dạy khi nào dùng tool nào.",
+      "category": "workflow",
+      "tags": ["gitlab", "work-items", "multi-session", "claim", "agent-loop"]
+    }
+  ]
+}
