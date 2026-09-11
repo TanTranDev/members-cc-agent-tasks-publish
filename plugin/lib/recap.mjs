@@ -26,7 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { parseAgentMeta, parseLabels } from './schema.mjs';
+import { parseAgentMeta, parseLabels, isCareful, gateStatusOf, normalizeDebt } from './schema.mjs';
 import { parseChangelogFragment } from './ingest/parsers.mjs';
 
 export const DEFAULT_DAYS = 7;
@@ -85,14 +85,18 @@ export function readItem(issue) {
   const parsed = parseAgentMeta(issue.description ?? '');
   const meta = parsed.meta ?? {};
 
+  // v0.3: `debt` trên item xong là MẢNG khoản nợ (mỗi khoản đã thành issue riêng); item cũ còn chuỗi.
+  const debts = normalizeDebt(meta.debt);
+  const debtText = debts.map((d) => (d.detail ? `${d.title} — ${d.detail}` : d.title)).join(' · ');
+
   return {
     iid: issue.iid,
     title: str(issue.title),
     url: issue.web_url ?? null,
     state: issue.state ?? null,
     status: scoped.status ?? null,
-    care: scoped.care === 'chat' ? 'chat' : 'thuong',
-    gate: scoped.gate ?? null,
+    care: isCareful({ labels: issue.labels ?? [], meta }) ? 'chat' : 'thuong',
+    gate: gateStatusOf({ labels: issue.labels ?? [], meta }),
     flags,
     // Bốn trường này ở v0.2 CHỈ còn trong meta (không còn nhãn) — recap là chỗ tiêu thụ chính
     // của chúng, nên nếu ai đó bỏ chúng khỏi meta thì recap là chỗ vỡ.
@@ -102,7 +106,9 @@ export function readItem(issue) {
     capability: meta.source?.capability ?? null,
     spec_delta: Array.isArray(meta.spec_delta) ? meta.spec_delta : [],
     tradeoff: str(meta.tradeoff),
-    debt: str(meta.debt),
+    debt: debtText,
+    debt_issues: Array.isArray(meta.links?.debt_issues) ? meta.links.debt_issues : [],
+    qc: meta.qc ?? null,
     hazard: str(meta.hazard),
     risk: str(meta.risk_declared),
     observe: meta.observe ?? null,
@@ -249,9 +255,11 @@ export function buildRecap(o = {}) {
     (r) => r.state === 'closed' && !r.completed_at && inWindow(r.updated_at),
   );
 
-  const inFlight = rows.filter((r) => r.status === 'claimed');
-  const waiting = rows.filter((r) => r.status === 'review');
-  const blocked = rows.filter((r) => r.status === 'blocked');
+  // Tên cột v0.3; `parseLabels` đã ánh xạ nhãn v0.2 nên item cũ vẫn rơi đúng ô.
+  const inFlight = rows.filter((r) => r.status === 'working' && r.state !== 'closed');
+  const waiting = rows.filter((r) => r.status === 'in-review' && r.state !== 'closed');
+  const blocked = rows.filter((r) => r.status === 'needs-you' && r.state !== 'closed');
+  const readyToMerge = rows.filter((r) => r.status === 'ready-to-merge' && r.state !== 'closed');
 
   // Đổi hành vi, gộp theo capability — người đọc quan tâm "capability nào động", không phải
   // "item nào động".
@@ -314,7 +322,7 @@ export function buildRecap(o = {}) {
     debt_open: (o.openDebtIssues ?? []).map(readItem),
     changelog: clDated,
     knowledge: kn.docs ?? [],
-    now: { in_flight: inFlight, waiting, blocked },
+    now: { in_flight: inFlight, waiting, blocked, ready_to_merge: readyToMerge },
     silent,
   };
 }
@@ -361,13 +369,13 @@ export function renderRecap(r) {
   if (!r.done.length) {
     L.push('', '_Không item nào có mốc "agent báo xong" trong cửa sổ này._');
   } else {
-    L.push('', '| # | Việc | CẨN | Gate | Đổi hành vi |', '|---|---|---|---|---|');
+    L.push('', '| # | Việc | Careful | Gate | Đổi hành vi |', '|---|---|---|---|---|');
     for (const it of r.done.slice(0, LIMIT)) {
       const beh = it.spec_delta.length
         ? it.spec_delta.map((d) => `\`${d.capability}\``).filter((v, i, a) => a.indexOf(v) === i).join(' ')
         : '—';
       L.push(
-        `| [#${it.iid}](${it.url ?? '#'}) | ${it.title} | ${it.care === 'chat' ? '🔴 CHẶT' : '·'} | ` +
+        `| [#${it.iid}](${it.url ?? '#'}) | ${it.title} | ${it.care === 'chat' ? '🔴 careful' : '·'} | ` +
           `${gateIcon(it.gate)} | ${beh} |`,
       );
     }
@@ -404,7 +412,8 @@ export function renderRecap(r) {
     L.push('', '_Không item nào khai nợ trong kỳ._');
   } else {
     for (const it of r.debt_new.slice(0, LIMIT)) {
-      L.push(`- [#${it.iid}](${it.url ?? '#'}) ${it.title} — ${clip(it.debt, 300)}`);
+      const issues = it.debt_issues.length ? ` → issue ${ids(it.debt_issues)}` : '';
+      L.push(`- [#${it.iid}](${it.url ?? '#'}) ${it.title} — ${clip(it.debt, 300)}${issues}`);
     }
     L.push(overflow(r.debt_new));
   }
@@ -447,9 +456,10 @@ export function renderRecap(r) {
   L.push('', '## Bây giờ đang ở đâu');
   L.push(
     '',
-    `- **đang làm** (${n.in_flight.length}): ${ids(n.in_flight.map((x) => x.iid))}`,
-    `- **chờ NGƯỜI duyệt** (${n.waiting.length}): ${ids(n.waiting.map((x) => x.iid))}`,
-    `- **bế tắc, chờ NGƯỜI gỡ** (${n.blocked.length}): ${ids(n.blocked.map((x) => x.iid))}`,
+    `- **Working** (${n.in_flight.length}): ${ids(n.in_flight.map((x) => x.iid))}`,
+    `- **Needs you — cần bạn** (${n.blocked.length}): ${ids(n.blocked.map((x) => x.iid))}`,
+    `- **In review — chờ bạn QC** (${n.waiting.length}): ${ids(n.waiting.map((x) => x.iid))}`,
+    `- **Ready to merge** (${n.ready_to_merge.length}): ${ids(n.ready_to_merge.map((x) => x.iid))}`,
   );
 
   // ── chỗ không có dấu vết

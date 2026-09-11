@@ -348,6 +348,37 @@ export function createGitLabClient({
       return (await request('PUT', `${issuesPath}/${iid}`, { body: { state_event: 'close' } })).data;
     },
 
+    /**
+     * v0.3: đặt assignee để card trên board hiện AI đang làm. `ids = []` ⇒ bỏ assignee.
+     * GitLab Free chỉ nhận MỘT assignee; truyền mảng một phần tử là đủ và chạy ở mọi tier.
+     */
+    async setAssignees(iid, ids) {
+      return (await request('PUT', `${issuesPath}/${iid}`, { body: { assignee_ids: ids } })).data;
+    },
+
+    // ── Issue board (v0.3) — dựng 5 cột cho người, một lần mỗi project ──────────────────────
+    //
+    // Free tier cho MỘT board mỗi project; tạo thêm trả 403/422. `ensureBoard` vì thế dùng lại
+    // board đầu tiên đang có thay vì đòi tạo board tên "Agent" — cột mới đi vào board đó.
+
+    async listBoards() {
+      return (await request('GET', `/projects/${proj}/boards`)).data;
+    },
+
+    async createBoard(name) {
+      return (await request('POST', `/projects/${proj}/boards`, { body: { name } })).data;
+    },
+
+    async listBoardLists(boardId) {
+      return (await request('GET', `/projects/${proj}/boards/${boardId}/lists`)).data;
+    },
+
+    async createBoardList(boardId, labelId) {
+      return (
+        await request('POST', `/projects/${proj}/boards/${boardId}/lists`, { body: { label_id: labelId } })
+      ).data;
+    },
+
     async createNote(iid, bodyText) {
       return (await request('POST', `${issuesPath}/${iid}/notes`, { body: { body: bodyText } })).data;
     },

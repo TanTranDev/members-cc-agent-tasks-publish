@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { parseSpecFile, parseChangelogFragment, parseBriefFile } from './parsers.mjs';
 import { planIngest, collectDebt, renderItem, sourceKeyFor, contentHash } from './plan.mjs';
-import { parseAgentMeta, labelFor } from '../schema.mjs';
+import { parseAgentMeta, labelFor, CAREFUL_LABEL } from '../schema.mjs';
 
 const listDirs = (p) => (fs.existsSync(p) ? fs.readdirSync(p) : []);
 
@@ -37,9 +37,8 @@ export function collectSpecSources(root) {
           `### Scenario cần thoả\n\n${scenarios}\n\n` +
           `---\n📎 Nguồn: \`specs/${cap}/spec.md\``,
         acceptance: req.scenarios.map((s) => `${s.name}: WHEN ${s.when} THEN ${s.then}`),
-        // v0.2: chỉ `status` còn là nhãn. `source`/`qc`/`gate::pending` đã nghỉ — `source.kind`
-        // nằm trong agent-meta (renderItem ghi), `qc` là ngõ cụt, và `gate::pending` = VẮNG nhãn.
-        labels: [labelFor('status', 'ready')],
+        // Chỉ `status` là nhãn (cột Backlog). `source.kind` nằm trong agent-meta (renderItem ghi).
+        labels: [labelFor('status', 'backlog')],
         debt: parsed.errors,
       });
     }
@@ -73,8 +72,8 @@ export function collectChangelogSources(root) {
         shape: parsed.shape,
         care: parsed.care,
         // Item từ changelog là việc ĐÃ XONG (tạo ra đã đóng) nên không có `status`. `shape` đi
-        // vào agent-meta; chỉ `care::chat` còn là nhãn, và mức thường = VẮNG nhãn.
-        labels: parsed.care === 'chat' ? [labelFor('care', 'chat')] : [],
+        // vào agent-meta; chỉ việc chạm thứ đắt mới có nhãn (`careful`), mức thường = VẮNG nhãn.
+        labels: parsed.care === 'chat' ? [CAREFUL_LABEL] : [],
         debt: parsed.debt,
       });
     }
@@ -106,7 +105,7 @@ export function collectBriefSources(root) {
         `## Tiêu chí hoàn thành\n\n${acc || '_không tách được — xem toàn văn bên dưới_'}\n\n` +
         `<details><summary>Toàn văn brief</summary>\n\n${parsed.raw}\n\n</details>`,
       acceptance: parsed.acceptance,
-      labels: [labelFor('status', 'ready')],
+      labels: [labelFor('status', 'backlog')],
       debt: parsed.debt,
     });
   }

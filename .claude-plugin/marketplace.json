@@ -11,7 +11,7 @@
     {
       "name": "agent-tasks",
       "source": "./plugin",
-      "description": "Chống trùng task giữa nhiều phiên agent bằng claim có TTL trên git refs, và trả lời được \"N ngày qua dự án đổi gì, vì sao\". 15 MCP tool + 7 skill dạy khi nào dùng tool nào.",
+      "description": "Board 5 cột human-first cho nhiều phiên agent trên GitLab: chống trùng task bằng claim có TTL trên git refs, hiện ai đang làm, hướng dẫn QC bắt buộc, nợ thành issue, agent đóng issue khi người ok. 15 MCP tool + 7 skill.",
       "category": "workflow",
       "tags": ["gitlab", "work-items", "multi-session", "claim", "agent-loop"]
     }

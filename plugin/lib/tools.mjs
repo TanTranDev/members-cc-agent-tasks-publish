@@ -3,21 +3,30 @@
 // Tách như vậy để test được toàn bộ nghiệp vụ mà không phải dựng stdio harness, và để lúc SDK
 // đổi (v2 đang beta) chỉ phải sửa adapter.
 //
-// Ngân sách: 14 tool vận hành + 1 tool cài đặt = 15. Anthropic đo được rằng quá "a couple of dozen"
-// tool thì độ chính xác chọn tool của model giảm — nên đây là trần cứng, không phải gợi ý.
-// Trần đã được nâng 14 → 15 ở lô 2 (D21); lý do đầy đủ ghi ở đầu lib/tool-defs.mjs.
+// Ngân sách: 15 tool vận hành — trần cứng, lý do ở đầu lib/tool-defs.mjs.
+//
+// v0.3 — HUMAN-FIRST (docs/11). Bốn thứ đổi so với v0.2 mà ai sửa file này phải biết:
+//   1. Trạng thái = CỘT trên board: backlog · working · needs-you · in-review · ready-to-merge.
+//   2. Mọi lượt claim/nhả ghi khối "Đang làm" ở ĐẦU description (+ assignee nếu biết user id):
+//      người mở item thấy ngay ai / máy nào / agent nào đang giữ.
+//   3. `task_complete` đòi HƯỚNG DẪN QC và biến `debt` thành ISSUE MỚI trong Backlog.
+//   4. `task_close` — agent đóng issue khi người đã ok.
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 import {
   labelFor, parseLabels, parseAgentMeta, writeAgentMeta, validateComplete, labelDefinitions,
-  META_VERSION, SHAPE, CARE, ROLE,
+  normalizeDebt, gateStatusOf, isCareful, migrationPlan,
+  META_VERSION, SHAPE, CARE, ROLE, STATUS_HUMAN, CAREFUL_LABEL, NEEDS_KIND,
 } from './schema.mjs';
 import { itemKeyFor, isExpired } from './claim.mjs';
 import { TOOL_DEFS, SETUP_TOOL_DEFS, ALL_TOOL_NAMES } from './tool-defs.mjs';
 import { discoverDocs, contentHash } from './doc-sync.mjs';
-import { upsertBlock, DOCS_MARKER, BRIEF_MARKER, OUTCOME_MARKER } from './desc-block.mjs';
+import {
+  upsertBlock, removeBlock, DOCS_MARKER, BRIEF_MARKER, OUTCOME_MARKER, WHO_MARKER, REQUEST_MARKER,
+  NEEDS_MARKER,
+} from './desc-block.mjs';
 import { parseLedger } from './evidence.mjs';
 import { keywords, slugify, titleFromBrief, rankCandidates } from './task-match.mjs';
 import { buildRecap, renderRecap, normalizeDays } from './recap.mjs';
@@ -36,13 +45,12 @@ export function toolError(message) {
 }
 
 /**
- * Số item quét MỘT TRANG khi phải lọc theo agent-meta (v0.2: `role`/`shape`/`source`/`care=thuong`
- * không còn là nhãn nên không lọc được server-side).
+ * Số item quét MỘT TRANG khi phải lọc theo agent-meta (`role`/`shape`/`source`/`care=thuong`
+ * không phải nhãn nên không lọc được server-side).
  *
  * Một trang, không phân trang hết: `listAllIssues` đi tới `maxPages` nên một bộ lọc hẹp trên
  * project lớn sẽ nổ thành hàng chục request cho một lệnh mà agent gọi rất thường. Đổi lại, kết
- * quả có thể KHÔNG ĐỦ — nên mọi lệnh dùng nó phải trả `scan` kèm `truncated` và NÓI RA. Cắt im
- * lặng ở đây tệ hơn hẳn: "hàng đợi còn 2 việc" trong khi còn 60.
+ * quả có thể KHÔNG ĐỦ — nên mọi lệnh dùng nó phải trả `scan` kèm `truncated` và NÓI RA.
  */
 const SCAN_PER_PAGE = 100;
 
@@ -51,15 +59,18 @@ const ok = (structured, text) => ({
   structuredContent: structured,
 });
 
+const stampOf = (ms) => `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
 /**
  * Dựng bảng handler.
  * @param {{cfg: object, gitlab: object, claims: object, ingest?: object, probe?: object,
- *          root?: string|null, rateLimiter?: object, now?: () => number}} deps
+ *          root?: string|null, rateLimiter?: object, now?: () => number, identity?: object}} deps
  */
 export function createHandlers(deps) {
   const { cfg, gitlab, claims } = deps;
   const root = deps.root ?? null;
   const now = deps.now ?? (() => Date.now());
+  const identity = deps.identity ?? null;
   const keyOf = (iid) => itemKeyFor(cfg.gitlabHost, cfg.projectPath, iid);
 
   /** Mọi tool GHI đi qua đây: xác thực chủ claim trước, không có ngoại lệ. */
@@ -83,17 +94,12 @@ export function createHandlers(deps) {
     );
   }
 
-  /** Đồng bộ nhãn lên GitLab. Lỗi ở đây KHÔNG huỷ claim — ref mới là nguồn sự thật. */
+  /** Đồng bộ nhãn cột lên GitLab. Lỗi ở đây KHÔNG huỷ claim — ref mới là nguồn sự thật. */
   async function syncStatus(iid, status) {
     try {
-      // `needs-advice` do `task_block` gắn, và trước 0.1.12 KHÔNG lệnh nào gỡ nó.
-      // Item đi blocked → review vẫn đeo nhãn nói "còn chờ người gỡ", tức đúng cái
-      // thông tin sai mà nhãn tồn tại để truyền đạt — QC đọc vào là hiểu lệch.
-      //
-      // Chỉ gỡ ở đường sang `review`: đó là lúc agent tuyên bố xong nên "cần cố vấn"
-      // chắc chắn đã cũ. KHÔNG gỡ ở `claimed`/`ready`, vì ở đó nhãn có thể do NGƯỜI
-      // gắn để chặn agent nhặt việc — gỡ hộ là xoá tín hiệu của họ.
-      const alsoRemove = status === 'review' ? ['needs-advice'] : [];
+      // `needs-advice` là nhãn v0.2 mà task_block từng gắn. Gỡ khi item đi tiếp — nhưng KHÔNG gỡ
+      // lúc về backlog: ở đó nhãn có thể do NGƯỜI gắn để chặn agent nhặt việc.
+      const alsoRemove = status === 'in-review' || status === 'working' ? ['needs-advice'] : [];
       await gitlab.setExclusiveLabel(iid, 'status', status, { alsoRemove });
       return null;
     } catch (err) {
@@ -102,10 +108,101 @@ export function createHandlers(deps) {
     }
   }
 
+  // ── Khối "Đang làm" + assignee ─────────────────────────────────────────────────────────────
+  //
+  // Vì sao ghi vào description mà không chỉ dựa vào assignee: assignee cần user id GitLab, mà token
+  // thường là group token (bot) ⇒ không biết "người" là ai. Khối văn bản thì luôn ghi được, và nó
+  // nói được cả ba thứ người hỏi: ai · máy nào · agent nào. Assignee là phần thêm cho card.
+
+  /** @type {number|null|undefined} undefined = chưa dò; null = dò rồi, không có */
+  let assigneeId = identity?.gitlabUserId ?? undefined;
+  async function resolveAssignee() {
+    if (assigneeId !== undefined) return assigneeId;
+    try {
+      const me = typeof gitlab.whoami === 'function' ? await gitlab.whoami() : null;
+      // Group/project token trả về một bot user — assign cho bot thì card hiện avatar robot vô nghĩa.
+      assigneeId = me && me.id && me.bot !== true ? Number(me.id) : null;
+    } catch {
+      assigneeId = null;
+    }
+    return assigneeId;
+  }
+
+  /**
+   * Dòng người đọc: ai đang giữ. `claim` null ⇒ không ai.
+   * @param {object|null} claim
+   * @param {string} status
+   */
+  function renderWhoBlock(claim, status) {
+    if (claim) {
+      const who = claim.owner ?? identity?.owner ?? '?';
+      const host = claim.host ?? identity?.host ?? '?';
+      const agent = claim.agent_name ?? claim.agent_role ?? identity?.agentName ?? identity?.agentRole ?? 'agent';
+      const since = claim.acquired_at ? stampOf(Date.parse(claim.acquired_at)) : stampOf(now());
+      const until = claim.expires_at ? stampOf(Date.parse(claim.expires_at)) : '?';
+      return (
+        `> 🧑‍💻 **Đang làm:** \`${who}\` @ \`${host}\` · agent \`${agent}\` · từ ${since} · claim hết hạn ${until}` +
+        `\n> _Claim tự gia hạn khi agent còn sống; hết hạn mà không gia hạn = agent đã dừng, việc quay lại Backlog._`
+      );
+    }
+    const line = {
+      backlog: '> 📭 **Chưa ai nhận.** Agent chế độ auto sẽ tự bóc, hoặc bạn giao cho một agent cụ thể.',
+      'needs-you': '> 🙋 **Cần bạn.** Agent đã dừng — đọc khối "Cần bạn" bên dưới rồi trả lời / kéo card về Backlog.',
+      'in-review': '> 🔍 **Chờ bạn QC.** Agent đã xong — kiểm theo khối "Cách kiểm" rồi kéo card sang Ready to merge.',
+      'ready-to-merge': '> ✅ **QC đạt, chờ merge.** Bạn merge/rebase, hoặc bảo agent làm rồi đóng.',
+      closed: '> 🏁 **Đã đóng.**',
+    }[status];
+    return line ?? '> _Không ai đang giữ._';
+  }
+
+  /**
+   * Ghi khối "Đang làm" + assignee. Mọi lỗi thành warning — đây là mặt hiển thị.
+   * @param {number} iid
+   * @param {object|null} claim
+   * @param {string} status
+   * @param {string} [description] description đã có trong tay (tránh một GET thừa)
+   * @returns {Promise<{description: string|null, warnings: string[]}>}
+   */
+  async function syncWho(iid, claim, status, description) {
+    /** @type {string[]} */ const warnings = [];
+    let out = null;
+    try {
+      const desc = description ?? (await gitlab.getIssue(iid)).description ?? '';
+      const next = upsertBlock(desc, WHO_MARKER, renderWhoBlock(claim, status), { position: 'top' });
+      if (next !== desc) await gitlab.updateIssue(iid, { description: next });
+      out = next;
+    } catch (err) {
+      warnings.push(
+        `⚠️ Không ghi được khối "Đang làm" lên #${iid} (${/** @type {Error} */ (err).message}). ` +
+          `Claim vẫn hợp lệ; người đọc item sẽ không thấy ai đang giữ cho tới lần ghi sau.`,
+      );
+    }
+    if (typeof gitlab.setAssignees === 'function') {
+      try {
+        const id = claim ? await resolveAssignee() : null;
+        if (claim && id) await gitlab.setAssignees(iid, [id]);
+        if (!claim) await gitlab.setAssignees(iid, []);
+      } catch (err) {
+        warnings.push(`⚠️ Không đặt được assignee trên #${iid} (${/** @type {Error} */ (err).message}).`);
+      }
+    }
+    return { description: out, warnings };
+  }
+
+  /** Sau khi acquire: đổi cột + ghi ai đang làm. Gom lại vì mọi đường claim đều cần y hệt. */
+  async function afterClaim(iid, claim, description) {
+    /** @type {string[]} */ const warnings = [];
+    const w = await syncStatus(iid, 'working');
+    if (w) warnings.push(w);
+    const r = await syncWho(iid, { ...claim, agent_name: identity?.agentName ?? null }, 'working', description);
+    warnings.push(...r.warnings);
+    return warnings;
+  }
+
   /**
    * Tài liệu đã đính chưa? Trả mảng warning (rỗng = ổn).
    *
-   * NHẮC, không CHẶN (spec D10). Chặn ở đây sẽ khiến agent bế tắc không báo được `blocked` chỉ vì
+   * NHẮC, không CHẶN (spec D10). Chặn ở đây sẽ khiến agent bế tắc không báo được `needs-you` chỉ vì
    * thiếu một file tài liệu — biến cơ chế trợ giúp thành cái bẫy.
    */
   function docsWarnings(description) {
@@ -129,8 +226,6 @@ export function createHandlers(deps) {
       return out;
     }
 
-    // §6.5/D10 đòi nhắc CẢ ca "hash lệch": đính rồi còn sửa file thì bản trên GitLab đã cũ, và QC
-    // sẽ đọc bản cũ mà không biết. So lại hash từng file đã đính.
     if (!root) return out;
     const stale = [];
     for (const [key, rec] of Object.entries(docs)) {
@@ -141,7 +236,6 @@ export function createHandlers(deps) {
       try {
         text = fs.readFileSync(abs, 'utf8');
       } catch {
-        // File đã đính giờ không đọc được — cũng đáng nói, nhưng không phải "lệch".
         stale.push(`${rec.name ?? key} (nguồn ${rec.path} giờ không đọc được)`);
         continue;
       }
@@ -157,8 +251,8 @@ export function createHandlers(deps) {
   }
 
   /**
-   * Đính tài liệu + set nhãn gate. Gộp việc của task_attach_gate_evidence (spec D8): một lần đọc
-   * ledger phục vụ cả upload, tóm tắt và nhãn.
+   * Đính tài liệu + lưu kết quả gate vào meta. Gộp việc của task_attach_gate_evidence (spec D8):
+   * một lần đọc ledger phục vụ cả upload, tóm tắt và gate.
    *
    * Khai ở đây (không phải trong object handlers) để tên này trỏ vào CÙNG một hàm mà không qua
    * `this` — `handlers` bị destructure ở nhiều nơi, lúc đó `this` là undefined.
@@ -176,8 +270,6 @@ export function createHandlers(deps) {
     const issue = await gitlab.getIssue(a.work_item_iid);
     const parsed = parseAgentMeta(issue.description ?? '');
 
-    // Meta hỏng ⇒ DỪNG. parseAgentMeta cố ý không throw ở ca này, nên nếu đi tiếp thì
-    // writeAgentMeta sẽ thay khối hỏng bằng {docs:…} và xoá mất hazard/acceptance của người khác.
     if (parsed.corrupt) {
       return toolError(
         `Khối agent-meta trên #${a.work_item_iid} HỎNG (JSON không đọc được) — KHÔNG ghi để tránh ` +
@@ -192,8 +284,6 @@ export function createHandlers(deps) {
       );
     }
 
-    // Kiểm khối docs có ghi được KHÔNG, TRƯỚC khi upload. Marker hỏng phát hiện sau khi upload thì
-    // file đã lên GitLab thành mồ côi mà description vẫn không đổi.
     try {
       upsertBlock(issue.description ?? '', DOCS_MARKER, 'probe');
     } catch (err) {
@@ -213,9 +303,6 @@ export function createHandlers(deps) {
     /** @type {string[]} */
     const warnings = [];
 
-    // Lỗi ở nguồn agent TỰ KHAI ⇒ chặn cứng (agent gõ sai, sửa được ngay).
-    // Lỗi ở nguồn ta SUY RA ⇒ chỉ cảnh báo: chặn cả lượt vì một file agent chưa từng gõ tên là
-    // đổ lỗi sai chỗ, và lời khuyên "sửa đường dẫn" cũng vô nghĩa với nó.
     const declaredErrors = found.errors.filter((e) => e.declared);
     const inferredErrors = found.errors.filter((e) => !e.declared);
 
@@ -240,7 +327,6 @@ export function createHandlers(deps) {
       });
     }
 
-    // Ma sát chỉ đặt ở chỗ rủi ro thật: mtime là chỗ hai phiên song song tranh nhau (spec D9).
     if (found.hasWeak && a.confirm !== true) {
       return ok({
         dry_run: true,
@@ -255,8 +341,6 @@ export function createHandlers(deps) {
       });
     }
 
-    // Khoá theo ĐƯỜNG DẪN NGUỒN, không theo tên hiển thị: tên hiển thị đổi khi số lượng file api
-    // đổi (api-spec.md ↔ api-spec-x.md), và khoá theo tên từng làm upload lặp vô hạn.
     const prev = parsed.meta?.docs ?? {};
     const metaKey = (d) => `${d.kind}:${d.path}`;
     const toUpload = found.docs.filter((d) => prev[metaKey(d)]?.hash !== d.hash);
@@ -264,28 +348,32 @@ export function createHandlers(deps) {
 
     const ledgerDoc = found.docs.find((d) => d.kind === 'ledger');
     const ev = ledgerDoc ? parseLedger(ledgerDoc.content, ledgerDoc.path) : null;
-    // parseLedger có message đúng chuẩn cho ca này; bản đầu chỉ dùng `if (ev?.ok)` nên nó không
-    // đi đâu cả và agent không hiểu vì sao gate vẫn pending.
     if (ev && !ev.ok) warnings.push(ev.message);
 
-    /** Đặt nhãn gate. Lỗi ở đây KHÔNG được im lặng — xem syncStatus cùng file. */
-    const syncGate = async () => {
-      if (!ev?.ok) return;
-      try {
-        await gitlab.setExclusiveLabel(a.work_item_iid, 'gate', ev.gateStatus);
-      } catch (err) {
-        warnings.push(
-          `Không đặt được nhãn gate::${ev.gateStatus} trên GitLab (${/** @type {Error} */ (err).message}). ` +
-            `Tài liệu ĐÃ đính; chỉ mặt hiển thị chưa khớp. task_complete có thể đòi gate_waiver — ` +
-            `ĐỪNG điền waiver nếu gate thật đã xanh, hãy chạy tasks_doctor --fix hoặc đặt nhãn tay.`,
-        );
-      }
+    // v0.3: gate KHÔNG còn là nhãn. Kết quả nằm trong meta (`gate`) để validateComplete và khối
+    // "Kết quả" đọc; người QC xem trong khối tài liệu (tóm tắt gate) chứ không đọc chip nhãn.
+    const gateMeta = ev?.ok
+      ? { status: ev.gateStatus, head: ev.head ?? null, dirty: ev.dirty ?? null, at: new Date(now()).toISOString() }
+      : null;
+
+    const writeMeta = async (description, docsMeta) => {
+      const withMeta = writeAgentMeta(description, {
+        ...(parsed.meta ?? {}),
+        docs: docsMeta,
+        ...(gateMeta ? { gate: gateMeta } : {}),
+      });
+      await gitlab.updateIssue(a.work_item_iid, { description: withMeta });
     };
 
     if (!toUpload.length) {
-      // Nhãn gate vẫn phải đồng bộ dù không có gì để upload — nó là mặt hiển thị của ledger, không
-      // phải hệ quả của việc upload.
-      await syncGate();
+      // Không có gì upload nhưng gate có thể vừa đổi (ledger sửa exit code) ⇒ vẫn ghi meta khi lệch.
+      if (gateMeta && parsed.meta?.gate?.status !== gateMeta.status) {
+        try {
+          await writeMeta(issue.description ?? '', prev);
+        } catch (err) {
+          warnings.push(`Không lưu được kết quả gate vào agent-meta: ${/** @type {Error} */ (err).message}`);
+        }
+      }
       return ok({
         attached: [],
         skipped_unchanged: unchanged.map((d) => ({ kind: d.kind, name: d.name, path: d.path })),
@@ -297,8 +385,6 @@ export function createHandlers(deps) {
       });
     }
 
-    // Upload trước, ghi description sau. Nhưng nếu lỗi giữa vòng thì vẫn phải LƯU những gì đã lên:
-    // mất upload_id là mất đường dọn (trái R1), và lần thử sau sẽ upload lại thành bản trùng.
     /** @type {Record<string, object>} */
     const docsMeta = { ...prev };
     const uploaded = [];
@@ -320,14 +406,10 @@ export function createHandlers(deps) {
 
     const all = [...uploaded, ...unchanged.map((d) => ({ ...d, url: prev[metaKey(d)].url }))];
 
-    // Ghi những gì đã lên được — kể cả khi lỗi giữa vòng. Trạng thái này NHẤT QUÁN (description
-    // đúng với những file thật có trên GitLab), chỉ là chưa đủ; còn bỏ trắng thì mất upload_id.
     if (all.length) {
-      let description;
       try {
-        description = upsertBlock(issue.description ?? '', DOCS_MARKER, renderDocsBlock(all, ev, now()));
-        const withMeta = writeAgentMeta(description, { ...(parsed.meta ?? {}), docs: docsMeta });
-        await gitlab.updateIssue(a.work_item_iid, { description: withMeta });
+        const description = upsertBlock(issue.description ?? '', DOCS_MARKER, renderDocsBlock(all, ev, now()));
+        await writeMeta(description, docsMeta);
       } catch (err) {
         return toolError(
           `${/** @type {Error} */ (err).message}\n\n` +
@@ -336,8 +418,6 @@ export function createHandlers(deps) {
         );
       }
     }
-
-    await syncGate();
 
     if (uploadError) {
       return toolError(
@@ -348,8 +428,6 @@ export function createHandlers(deps) {
       );
     }
 
-    // Tài liệu từng đính nhưng lần này không còn trong danh sách ⇒ nó đã rụng khỏi bảng. Nói ra,
-    // vì link cũ biến mất khỏi item mà meta vẫn khai là có.
     const nowKeys = new Set(found.docs.map(metaKey));
     const dropped = Object.entries(prev)
       .filter(([k]) => !nowKeys.has(k))
@@ -372,17 +450,13 @@ export function createHandlers(deps) {
     });
   };
 
-  // ─────────────────────────── LUỒNG VÀO (lô 2) ───────────────────────────
+  // ─────────────────────────── LUỒNG VÀO ───────────────────────────
   //
-  // `capability` đi vào agent-meta, rồi lô 1 dùng nó dựng đường dẫn `specs/<capability>/spec.md`.
-  // doc-sync đã chặn đường dẫn thoát root, nhưng chặn NGAY TẠI CỬA VÀO thì dữ liệu bẩn không bao
-  // giờ nằm trong hệ thống — rẻ hơn nhiều so với chặn ở mọi nơi tiêu thụ nó.
+  // `capability` đi vào agent-meta, rồi được dùng dựng đường dẫn `specs/<capability>/spec.md`.
+  // Chặn NGAY TẠI CỬA VÀO thì dữ liệu bẩn không bao giờ nằm trong hệ thống.
   const SAFE_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+  const TITLE_MAX = 80;
 
-  /**
-   * Dò ứng viên trùng. Trả cả `warnings` vì lỗi tra cứu KHÔNG được lặng lẽ thành "sạch" —
-   * coi lỗi search là "không có ứng viên" chính là cách sinh ra item trùng mà không ai biết.
-   */
   async function findCandidates({ slug, queryKeywords }) {
     /** @type {object[]} */ const found = [];
     /** @type {string[]} */ const warnings = [];
@@ -394,8 +468,6 @@ export function createHandlers(deps) {
       if (!search) return;
       searches.push({ search, why });
       try {
-        // `state: 'all'` — item đã đóng vẫn phải thấy: EXACT đã đóng nghĩa là việc TÁI PHÁT, và
-        // người đọc cần biết lần trước làm ở đâu (D17).
         const items = await gitlab.listIssues({ search, state: 'all', perPage: 20 });
         okCount++;
         for (const it of items ?? []) {
@@ -411,11 +483,8 @@ export function createHandlers(deps) {
       }
     };
 
-    // Tầng 1 — khoá bền. Khớp tuyệt đối, không đoán.
     await lookup(slug ? `brief:${slug}` : null, 'khoá bền');
 
-    // Tầng 2 — mờ. Trần 3 lượt: đủ để bắt được ca thật mà không biến một lần intake thành chùm
-    // request. Lượt thứ ba chỉ chạy khi lượt hai trắng tay.
     if (queryKeywords.length) {
       const before = found.length;
       await lookup(queryKeywords.slice(0, 5).join(' '), 'từ khoá đặc trưng');
@@ -428,29 +497,47 @@ export function createHandlers(deps) {
     return { found, warnings, searches, allFailed: okCount === 0 && searches.length > 0 };
   }
 
-  /** Ứng viên → dòng người đọc được, kèm ai đang giữ. */
   function describeCandidate(c) {
     const held = claims.list().find((x) => x.item === keyOf(c.iid));
-    const who = held ? ` · ĐANG GIỮ: ${held.owner} tới ${held.expires_at}` : '';
+    const who = held ? ` · ĐANG GIỮ: ${held.owner}@${held.host ?? '?'} tới ${held.expires_at}` : '';
     const state = c.closed ? ' · đã đóng' : '';
     const why = c.signals.length ? ` — ${c.signals.join('; ')}` : '';
     return `[${c.tier}] #${c.iid} ${c.title ?? '(không có title)'}${state}${who}${why}`;
   }
 
+  /** Bản NGƯỜI đọc của một yêu cầu — thay cho việc dán nguyên văn câu chat làm description. */
+  function renderRequestBlock({ goal, scope, outOfScope, acceptance }) {
+    const L = ['## 🎯 Yêu cầu', ''];
+    L.push('**Mục tiêu**', '', String(goal ?? '').trim() || '_không khai — hỏi người yêu cầu_', '');
+    if (scope?.length) L.push('**Phạm vi**', '', ...scope.map((s) => `- ${s}`), '');
+    if (outOfScope?.length) L.push('**Không làm**', '', ...outOfScope.map((s) => `- ${s}`), '');
+    L.push('**Tiêu chí hoàn thành** _(người QC đối chiếu từng dòng)_', '', ...acceptance.map((s) => `- [ ] ${s}`));
+    return L.join('\n');
+  }
+
   const intake = async (a = {}) => {
     const brief = String(a.brief ?? '').trim();
-    if (!brief) {
+    const title = String(a.title ?? '').trim();
+    const acceptance = Array.isArray(a.acceptance)
+      ? a.acceptance.map((x) => String(x ?? '').trim()).filter(Boolean)
+      : [];
+
+    // Cổng "đã phỏng vấn chưa": title + acceptance là hai thứ chỉ viết được SAU khi hiểu việc.
+    /** @type {string[]} */ const need = [];
+    if (!title) need.push('`title` — tên việc bạn tự viết sau khi hiểu (động từ + đối tượng, ≤ 80 ký tự)');
+    if (!acceptance.length) need.push('`acceptance` — ít nhất một tiêu chí hoàn thành KIỂM ĐƯỢC');
+    if (!brief) need.push('`brief` — nguyên văn yêu cầu của người (để dò trùng và tham khảo)');
+    if (need.length) {
       return toolError(
-        'task_intake cần `brief`: mô tả việc cần làm, nguyên văn theo cách người dùng nói. ' +
-          'Dòng đầu sẽ thành title của work item.',
+        `task_intake thiếu:\n${need.map((n) => `- ${n}`).join('\n')}\n\n` +
+          'Chưa đủ để tạo item. Nếu bạn chưa biết điền gì: PHỎNG VẤN NGƯỜI trước (skill task-new) — ' +
+          'hỏi mục tiêu, phạm vi, và "xong thì kiểm bằng cách nào" — rồi gọi lại.',
       );
     }
-
-    const title = String(a.title ?? '').trim() || titleFromBrief(brief);
-    if (!title) {
+    if (title.length > TITLE_MAX) {
       return toolError(
-        'Không suy được title từ `brief` (không có dòng nào mang nội dung). Truyền `title` tường ' +
-          'minh, hoặc viết brief có một dòng mô tả việc.',
+        `title dài ${title.length} ký tự (> ${TITLE_MAX}). Title là TÊN VIỆC trên card, không phải mô tả — ` +
+          'rút lại, phần còn lại đưa vào `goal`.',
       );
     }
 
@@ -461,15 +548,8 @@ export function createHandlers(deps) {
       );
     }
 
-    // v0.2: `shape`/`role`/`source` KHÔNG còn là nhãn — chúng đã nằm trong agent-meta ở dưới, và
-    // ghi cả hai chỗ là đúng thứ docs/06 §2 cấm ("không lưu trùng"). Nhãn duy nhất còn dựng từ
-    // tham số phân loại là `care::chat`; mức thường = VẮNG nhãn.
-    //
-    // ⚠️ Nhưng bỏ `labelFor('role'|'shape')` là bỏ luôn CỔNG CHẶN GIÁ TRỊ RÁC — trước v0.2 chính
-    // labelFor ném lỗi khi nhận `role: 'be'`. Giá trị rác trong meta KHÔNG ném ở đâu cả: nó chỉ
-    // làm mọi bộ lọc `tasks_list`/`task_claim_next`/recap trượt vĩnh viễn, im lặng. Nên cổng phải
-    // được dựng lại tường minh ở đây — và phải chạy TRƯỚC mọi lời gọi ghi, vì ném sau
-    // `createIssue` là để lại một item nửa vời trên project của người ta.
+    // Cổng chặn giá trị rác trong meta: giá trị rác KHÔNG ném ở đâu cả, nó chỉ làm mọi bộ lọc
+    // trượt vĩnh viễn, im lặng. Phải chạy TRƯỚC mọi lời gọi ghi.
     for (const [field, allowed] of [['shape', SHAPE], ['care', CARE], ['role', ROLE]]) {
       const v = a[field];
       if (v != null && !allowed.includes(v)) {
@@ -479,17 +559,25 @@ export function createHandlers(deps) {
         );
       }
     }
-    const classLabels = a.care === 'chat' ? [labelFor('care', 'chat')] : [];
+    const classLabels = a.care === 'chat' ? [CAREFUL_LABEL] : [];
 
     const slug = slugify(a.slug ?? title);
     const capability = a.capability ?? null;
-    // Từ khoá lấy từ TITLE, không phải cả brief: brief dài sinh mấy chục từ khoá ⇒ trùng với gần
-    // như mọi item ⇒ bậc CAO bắt oan hàng loạt và không ai đọc danh sách ứng viên nữa.
     const queryKeywords = keywords(title);
 
     const probe = await findCandidates({ slug, queryKeywords });
     const ranked = rankCandidates({ slug, capability, keywords: queryKeywords }, probe.found);
     /** @type {string[]} */ const warnings = [...probe.warnings];
+
+    // Title trùng NGUYÊN VĂN dòng đầu của brief = dấu hiệu chưa phỏng vấn, chỉ dán câu chat.
+    // Cảnh báo chứ không chặn: có lúc người thật sự gõ một câu đã là title tốt.
+    const firstLine = titleFromBrief(brief);
+    if (firstLine && firstLine.trim().toLowerCase() === title.toLowerCase()) {
+      warnings.push(
+        'title trùng nguyên văn dòng đầu của brief — nếu bạn chưa phỏng vấn người yêu cầu thì đây là ' +
+          'câu chat, chưa phải tên việc. Item vẫn được tạo; sửa title trên GitLab nếu cần.',
+      );
+    }
 
     const candidates = ranked.listed.map((c) => ({
       iid: c.iid,
@@ -497,8 +585,6 @@ export function createHandlers(deps) {
       title: c.title,
       state: c.state,
       closed: c.closed,
-      // Backlog là Issues của chính repo code (spec M2) nên ứng viên có thể là issue do NGƯỜI viết.
-      // Vẫn xét nó (M7) nhưng nói rõ — agent cần biết để đọc/hỏi trước thay vì tạo bản song song.
       signals: c.managed
         ? c.signals
         : [
@@ -535,8 +621,6 @@ export function createHandlers(deps) {
       );
     }
 
-    // Dò trùng thất bại HOÀN TOÀN ⇒ không tạo. Tạo lúc này là đánh cược vào việc không trùng, mà
-    // đúng cái cược đó là thứ tool này sinh ra để bỏ.
     if (probe.allFailed && a.force !== true) {
       return ok(
         { ...base, created: false, claimed: false, work_item_iid: null, blocked_by: 'không dò được' },
@@ -559,7 +643,7 @@ export function createHandlers(deps) {
       if (heldByOther) {
         note =
           `#${target.iid} là CÙNG việc này (khoá bền brief:${slug}) và đang được ` +
-          `${heldByOther.owner} giữ tới ${heldByOther.expires_at}. Không tạo bản song song. ` +
+          `${heldByOther.owner}@${heldByOther.host ?? '?'} giữ tới ${heldByOther.expires_at}. Không tạo bản song song. ` +
           `Hỏi ${heldByOther.owner} trước — hoặc chờ claim hết hạn rồi gọi task_claim.`;
       } else if (mine.length) {
         note =
@@ -570,8 +654,7 @@ export function createHandlers(deps) {
         const rq = claims.acquire(keyOf(target.iid), { ttlSec: a.ttl_sec });
         if (rq.ok) {
           claimed = rq.claim;
-          const w = await syncStatus(target.iid, 'claimed');
-          if (w) warnings.push(w);
+          warnings.push(...(await afterClaim(target.iid, rq.claim, target.description)));
           note =
             `#${target.iid} là CÙNG việc này (khoá bền brief:${slug}) — không tạo item mới, ` +
             `đã claim #${target.iid} để bạn làm luôn.`;
@@ -598,10 +681,6 @@ export function createHandlers(deps) {
     }
 
     // ── CAO mà chưa `force`: dừng để agent đọc.
-    //
-    // Dùng `ok` chứ không `isError`: đây không phải lỗi gọi tool, và kết quả CHỨA đúng dữ liệu agent
-    // cần để quyết (danh sách ứng viên + signals). `isError` làm agent đi kiểm lại tham số của mình
-    // thay vì đọc ứng viên — sai hướng hoàn toàn.
     if (ranked.high.length && a.force !== true) {
       return ok(
         { ...base, created: false, claimed: false, work_item_iid: null, blocked_by: 'CAO' },
@@ -614,10 +693,14 @@ export function createHandlers(deps) {
     }
 
     // ── Tạo item.
+    const scope = Array.isArray(a.scope) ? a.scope.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+    const outOfScope = Array.isArray(a.out_of_scope)
+      ? a.out_of_scope.map((x) => String(x ?? '').trim()).filter(Boolean)
+      : [];
     const meta = {
       v: META_VERSION,
       source: {
-        kind: 'brief', // cùng "kind" với ingest ⇒ hai đường dùng CHUNG khoá bền brief:<slug> (D18)
+        kind: 'brief',
         path: null,
         hash: contentHash(brief),
         slug,
@@ -625,25 +708,30 @@ export function createHandlers(deps) {
       },
       shape: a.shape ?? null,
       care: a.care ?? null,
-      // Hazard phải nhận được TỪ ĐÂY. Trước 0.1.11 chỗ này hardcode null và không tool nào nhận
-      // hazard làm input, nên cổng `care::chat ⇒ hazard không rỗng` của validateComplete không bao
-      // giờ mở được: MỌI item care::chat, ở mọi repo, đều không đóng nổi. Cổng dựng để chống
-      // "CHẶT mà không khai hazard là nghi lễ" đã tự trở thành nghi lễ.
       hazard: String(a.hazard ?? '').trim() || null,
       role_hint: a.role ?? null,
-      acceptance: [],
+      goal: String(a.goal ?? '').trim() || null,
+      scope,
+      out_of_scope: outOfScope,
+      acceptance,
       spec_delta: [],
       risk_declared: null,
       review_required: false,
-      observe: 'l0',
       ingest_run: null,
       links: {},
-      history: [],
+      history: [{ at: new Date(now()).toISOString(), event: 'created', by: identity?.owner ?? null }],
     };
 
     let description;
     try {
-      description = writeAgentMeta(upsertBlock('', BRIEF_MARKER, brief), meta);
+      const request = renderRequestBlock({ goal: a.goal, scope, outOfScope, acceptance });
+      // Brief nguyên văn giữ marker riêng nhưng GẤP LẠI: người mở item đọc bản đã tiêu hoá (khối
+      // Yêu cầu) trước, câu chat chỉ để đối chiếu.
+      const rawBlock = `<details><summary>Nguyên văn yêu cầu (câu người nói)</summary>\n\n${brief}\n\n</details>`;
+      description = writeAgentMeta(
+        upsertBlock(upsertBlock('', REQUEST_MARKER, request), BRIEF_MARKER, rawBlock),
+        meta,
+      );
     } catch (err) {
       return toolError(
         `Không dựng được description: ${/** @type {Error} */ (err).message}. Kiểm nội dung brief.`,
@@ -655,7 +743,7 @@ export function createHandlers(deps) {
       issue = await gitlab.createIssue({
         title,
         description,
-        labels: [...classLabels, labelFor('status', 'ready')],
+        labels: [...classLabels, labelFor('status', 'backlog')],
       });
     } catch (err) {
       return toolError(
@@ -664,29 +752,27 @@ export function createHandlers(deps) {
       );
     }
 
-    // ── Claim theo tình huống (D13).
-    //
-    // ⚠️ Từ đây trở đi ITEM ĐÃ TỒN TẠI. Mọi lỗi phải trả về `created: true` kèm cảnh báo, KHÔNG
-    // phải isError — agent thấy "lỗi" sẽ gọi lại và tạo item thứ hai cho cùng một việc.
+    // ── Claim theo tình huống (D13). Từ đây ITEM ĐÃ TỒN TẠI: mọi lỗi phải trả `created: true`.
     const mine = claims.list().filter((c) => c.owner_id === claims.ownerId);
     let claimed = null;
     let note;
 
     if (mine.length) {
       note =
-        `Đã tạo #${issue.iid} ở status::ready và KHÔNG claim, vì phiên này đang giữ ` +
+        `Đã tạo #${issue.iid} ở Backlog và KHÔNG claim, vì phiên này đang giữ ` +
         `${mine.map((c) => c.item).join(', ')} — một việc một item. Xong việc đang giữ rồi gọi ` +
         `task_claim cho #${issue.iid}.`;
+      const r = await syncWho(issue.iid, null, 'backlog', description);
+      warnings.push(...r.warnings);
     } else {
       const rq = claims.acquire(keyOf(issue.iid), { ttlSec: a.ttl_sec });
       if (rq.ok) {
         claimed = rq.claim;
-        const w = await syncStatus(issue.iid, 'claimed');
-        if (w) warnings.push(w);
+        warnings.push(...(await afterClaim(issue.iid, rq.claim, description)));
         note = `Đã tạo #${issue.iid} và claim luôn — làm được ngay.`;
       } else {
         note =
-          `Đã tạo #${issue.iid} (đang ở status::ready) nhưng KHÔNG claim được: ` +
+          `Đã tạo #${issue.iid} (đang ở Backlog) nhưng KHÔNG claim được: ` +
           `${rq.message ?? rq.reason}. ĐỪNG gọi lại task_intake — item đã tồn tại. ` +
           `Sửa xong thì gọi task_claim cho #${issue.iid}.`;
       }
@@ -721,11 +807,8 @@ export function createHandlers(deps) {
   };
 
   /**
-   * Bộ lọc theo trường CHỈ CÒN trong agent-meta ở v0.2. Trả `null` khi lời gọi không lọc gì —
-   * để chỗ gọi biết mình được đi đường RẺ (một trang nhỏ, không phải quét rộng).
-   *
-   * `care` bất đối xứng có chủ đích: `chat` là nhãn ⇒ lọc server-side; `thuong` là VẮNG nhãn ⇒
-   * chỉ kiểm được ở client. Trộn hai đường vào một tham số là chỗ dễ hiểu sai nhất của v0.2.
+   * Bộ lọc theo trường CHỈ CÓ trong agent-meta. Trả `null` khi lời gọi không lọc gì.
+   * `care` bất đối xứng có chủ đích: `chat` là nhãn (`careful`) ⇒ server-side; `thuong` là VẮNG nhãn.
    */
   function metaMatcher(a = {}) {
     const want = {
@@ -737,7 +820,7 @@ export function createHandlers(deps) {
     if (!want.role && !want.shape && !want.source && !want.thuong) return null;
 
     return (issue) => {
-      if (want.thuong && parseLabels(issue.labels ?? []).scoped.care === 'chat') return false;
+      if (want.thuong && isCareful({ labels: issue.labels ?? [] })) return false;
       if (!want.role && !want.shape && !want.source) return true;
       const meta = parseAgentMeta(issue.description ?? '').meta ?? {};
       if (want.role && (meta.role_hint ?? null) !== want.role) return false;
@@ -747,12 +830,56 @@ export function createHandlers(deps) {
     };
   }
 
-  /** Nhãn lọc được server-side. `care::chat` là nhãn; `care=thuong` thì không (xem metaMatcher). */
+  /** Nhãn lọc được server-side. */
   function serverLabels(a = {}) {
     const out = [];
     if (a.status) out.push(labelFor('status', a.status));
-    if (a.care === 'chat') out.push(labelFor('care', 'chat'));
+    if (a.care === 'chat') out.push(CAREFUL_LABEL);
     return out;
+  }
+
+  /** Một hàng cho board / Orchestrator: đủ để vẽ card mà không phải đọc description. */
+  function boardRow(issue) {
+    const { scoped, flags, legacy } = parseLabels(issue.labels ?? []);
+    const meta = parseAgentMeta(issue.description ?? '').meta ?? {};
+    const c = claims.list().find((x) => x.item === keyOf(issue.iid));
+    return {
+      iid: issue.iid,
+      title: issue.title,
+      status: scoped.status ?? null,
+      column: STATUS_HUMAN[scoped.status] ?? null,
+      labels: issue.labels,
+      flags,
+      legacy_labels: legacy,
+      web_url: issue.web_url,
+      updated_at: issue.updated_at ?? null,
+      claimed_by: c
+        ? { owner: c.owner, host: c.host ?? null, agent: c.agent_name ?? c.agent_role ?? null, since: c.acquired_at ?? null, expires_at: c.expires_at }
+        : null,
+      needs: meta.needs ?? null,
+      mr: meta.links?.mr ?? null,
+      careful: flags.includes(CAREFUL_LABEL),
+    };
+  }
+
+  /** Khối "Cần bạn" — vì sao item ở Needs you và người phải làm gì. */
+  function renderNeedsBlock({ kind, reason, needs, by, at, holding }) {
+    const KIND = {
+      question: '❓ Câu hỏi',
+      decision: '⚖️ Cần quyết định',
+      blocked: '⛔ Bế tắc',
+      'ci-failed': '❌ CI đỏ',
+      'changes-requested': '✏️ Reviewer đòi sửa',
+    };
+    const L = [`## 🙋 Cần bạn · ${KIND[kind] ?? kind} · ${stampOf(at)}`, ''];
+    L.push(String(reason ?? '').trim() || '_không nêu_', '');
+    L.push('**Bạn cần làm gì**', '', String(needs ?? '').trim() || '_agent chưa nêu — hỏi lại_', '');
+    L.push(
+      holding
+        ? `_Agent \`${by}\` vẫn đang giữ claim và chờ câu trả lời (comment lên item)._`
+        : `_Agent \`${by}\` đã dừng và nhả claim. Trả lời bằng comment rồi kéo card về **Backlog** (hoặc giao lại cho một agent bằng task_claim)._`,
+    );
+    return L.join('\n');
   }
 
   return {
@@ -761,17 +888,12 @@ export function createHandlers(deps) {
     async tasks_list(a = {}) {
       const want = Math.min(Math.max(Number(a.limit) || 20, 1), 100);
       const match = metaMatcher(a);
-      // Có lọc theo meta ⇒ phải quét rộng rồi lọc, vì server không giúp được. Không lọc ⇒ lấy
-      // đúng `want` như trước, không đắt thêm một byte nào.
       const perPage = match ? SCAN_PER_PAGE : want;
       const raw = await gitlab.listIssues({ labels: serverLabels(a), state: 'opened', perPage });
 
       const filtered = match ? raw.filter(match) : raw;
       const items = filtered.slice(0, want);
-      const held = new Map(claims.list().map((c) => [c.item, c]));
 
-      // `truncated` là phần KHÔNG được im: quét một trang mà trang đó đầy thì kết quả này không
-      // phải toàn bộ hàng đợi, và một danh sách thiếu trông y hệt một hàng đợi ngắn.
       const truncated = raw.length >= perPage;
       const scan = {
         scanned: raw.length,
@@ -782,13 +904,7 @@ export function createHandlers(deps) {
       };
 
       return ok(
-        { count: items.length, scan, items: items.map((i) => {
-          const c = held.get(keyOf(i.iid));
-          return {
-            iid: i.iid, title: i.title, labels: i.labels, web_url: i.web_url,
-            claimed_by: c?.owner ?? null, expires_at: c?.expires_at ?? null,
-          };
-        }) },
+        { count: items.length, scan, items: items.map(boardRow) },
         truncated
           ? `${items.length} item (quét ${raw.length} item mới nhất — CÓ THỂ CÒN NỮA ngoài phạm vi ` +
             `quét; thu hẹp bằng \`status\` hoặc chấp nhận đây là một phần).`
@@ -799,13 +915,15 @@ export function createHandlers(deps) {
     async task_get(a) {
       const issue = await gitlab.getIssue(a.work_item_iid);
       const parsed = parseAgentMeta(issue.description ?? '');
-      const c = claims.list().find((x) => x.item === keyOf(a.work_item_iid));
+      const row = boardRow(issue);
 
       return ok(
         {
-          iid: issue.iid, title: issue.title, labels: issue.labels, state: issue.state,
-          web_url: issue.web_url, meta: parsed.meta, meta_corrupt: parsed.corrupt,
-          claim: c ? { owner: c.owner, expires_at: c.expires_at } : null,
+          ...row,
+          state: issue.state,
+          meta: parsed.meta,
+          meta_corrupt: parsed.corrupt,
+          claim: row.claimed_by,
         },
         wrapUntrusted(parsed.human, issue.iid),
       );
@@ -813,12 +931,10 @@ export function createHandlers(deps) {
 
     async task_claim_next(a = {}) {
       const match = metaMatcher(a);
-      // ⚠️ perPage PHẢI nới khi lọc theo meta. Ở v0.1 `role`/`shape` là nhãn nên server đã lọc
-      // trước khi phân trang; từ v0.2 chúng ở trong meta, nên giữ perPage 20 sẽ lấy 20 item cũ
-      // nhất RỒI mới lọc — item khớp vai đứng thứ 21 trở đi biến mất, và tool trả "hàng đợi
-      // không còn item nào khớp bộ lọc" trong khi hàng đợi đầy việc của đúng vai đó.
+      // perPage PHẢI nới khi lọc theo meta: giữ 20 sẽ lấy 20 item cũ nhất RỒI mới lọc — item khớp
+      // vai đứng thứ 21 trở đi biến mất, và tool báo "hết việc" trong khi Backlog đầy việc của vai đó.
       const candidates = await gitlab.listIssues({
-        labels: serverLabels({ ...a, status: 'ready' }),
+        labels: serverLabels({ ...a, status: 'backlog' }),
         state: 'opened',
         perPage: match ? SCAN_PER_PAGE : 20,
         orderBy: 'updated_at',
@@ -836,7 +952,7 @@ export function createHandlers(deps) {
           tried++;
           continue;
         }
-        const warn = await syncStatus(issue.iid, 'claimed');
+        const warnings = await afterClaim(issue.iid, r.claim, issue.description);
         const parsed = parseAgentMeta(issue.description ?? '');
 
         return ok(
@@ -845,11 +961,12 @@ export function createHandlers(deps) {
             expires_at: r.claim.expires_at, reclaimed: r.reclaimed === true,
             title: issue.title, web_url: issue.web_url, labels: issue.labels,
             acceptance: parsed.meta?.acceptance ?? [], hazard: parsed.meta?.hazard ?? null,
-            meta: parsed.meta, candidates_tried: tried, warning: warn,
+            meta: parsed.meta, candidates_tried: tried,
+            warning: warnings[0] ?? null, warnings,
           },
           `Đã giành #${issue.iid} — ${issue.title}\nHết hạn: ${r.claim.expires_at}\n` +
             (r.reclaimed ? '(thu hồi từ một claim đã chết)\n' : '') +
-            (warn ? `${warn}\n` : '') +
+            (warnings.length ? `${warnings.join('\n')}\n` : '') +
             `\n${wrapUntrusted(parsed.human, issue.iid)}`,
         );
       }
@@ -857,7 +974,7 @@ export function createHandlers(deps) {
       return ok({ claimed: false, work_item_iid: null, claim_token: null, candidates_tried: tried },
         tried > 0
           ? `Không giành được item nào: ${tried} ứng viên đều đã có phiên khác giữ. Thử lại sau.`
-          : 'Hàng đợi không còn item nào khớp bộ lọc.');
+          : 'Backlog không còn item nào khớp bộ lọc.');
     },
 
     async task_claim(a) {
@@ -865,19 +982,19 @@ export function createHandlers(deps) {
       const r = claims.acquire(keyOf(a.work_item_iid), { ttlSec: a.ttl_sec });
       if (!r.ok) return toolError(r.message ?? `Không giành được #${a.work_item_iid} (${r.reason}).`);
 
-      const warn = await syncStatus(a.work_item_iid, 'claimed');
+      const warnings = await afterClaim(a.work_item_iid, r.claim, issue.description);
       const parsed = parseAgentMeta(issue.description ?? '');
       return ok({
         claimed: true, work_item_iid: issue.iid, claim_token: r.claim.claim_token,
-        expires_at: r.claim.expires_at, title: issue.title, meta: parsed.meta, warning: warn,
+        expires_at: r.claim.expires_at, title: issue.title, meta: parsed.meta,
+        needs: parsed.meta?.needs ?? null,
+        warning: warnings[0] ?? null, warnings,
       });
     },
 
     async task_heartbeat(a) {
       const r = claims.renew(keyOf(a.work_item_iid), a.claim_token, { extendSec: a.extend_sec });
       if (r.ok) return ok({ renewed: true, lost_claim: false, expires_at: r.claim.expires_at });
-      // Phải tha CẢ 'local-setup': lỗi /tmp không phải mất khoá. Bỏ sót nó ở đây là đảo
-      // ngược đúng lý do LocalSetupError được tách khỏi RemoteError.
       if (r.reason === 'offline' || r.reason === 'local-setup' || r.reason === 'unreadable') {
         return ok({ renewed: false, lost_claim: false, reason: r.reason },
           `${r.message}\nClaim CHƯA chắc mất — mất mạng khác mất khoá. Nhưng nếu quá hạn mà vẫn không gia hạn được thì phiên khác sẽ thu hồi.`);
@@ -893,9 +1010,12 @@ export function createHandlers(deps) {
       const r = claims.release(keyOf(a.work_item_iid), a.claim_token);
       if (!r.ok) return toolError(r.message ?? `Không nhả được (${r.reason}).`);
 
-      await syncStatus(a.work_item_iid, 'ready');
+      /** @type {string[]} */ const warnings = [];
+      const w = await syncStatus(a.work_item_iid, 'backlog');
+      if (w) warnings.push(w);
+      warnings.push(...(await syncWho(a.work_item_iid, null, 'backlog')).warnings);
       if (a.reason) await gitlab.createNote(a.work_item_iid, `🤖 nhả claim: ${a.reason}`);
-      return ok({ released: true });
+      return ok({ released: true, warnings });
     },
 
     async task_report_progress(a) {
@@ -909,10 +1029,53 @@ export function createHandlers(deps) {
             `${Math.round(gate.minIntervalSec)}s để không spam item. Gộp nội dung vào lần sau.`,
         );
       }
-      const icon = { progress: '🔄', finding: '🔎', question: '❓', warning: '⚠️' }[a.kind ?? 'progress'];
+      const kind = a.kind ?? 'progress';
+      const icon = { progress: '🔄', finding: '🔎', question: '❓', warning: '⚠️' }[kind];
       await gitlab.createNote(a.work_item_iid, `${icon} ${a.message}`);
       deps.rateLimiter?.mark(a.work_item_iid, now());
-      return ok({ posted: true });
+
+      // v0.3 (docs/11 §C8): câu hỏi ⇒ item lên Needs you nhưng agent GIỮ claim. Mốc khác ⇒ về Working.
+      /** @type {string[]} */ const warnings = [];
+      let status = null;
+      try {
+        const issue = await gitlab.getIssue(a.work_item_iid);
+        const parsed = parseAgentMeta(issue.description ?? '');
+        const cur = parseLabels(issue.labels ?? []).scoped.status;
+        if (kind === 'question') {
+          status = 'needs-you';
+          const at = now();
+          const needs = { kind: 'question', reason: a.message, needs: 'trả lời bằng comment', at: new Date(at).toISOString(), holding: true };
+          const desc = upsertBlock(
+            issue.description ?? '',
+            NEEDS_MARKER,
+            renderNeedsBlock({ ...needs, by: identity?.owner ?? 'agent' }),
+            { position: 'top' },
+          );
+          if (!parsed.corrupt && !parsed.tooNew) {
+            await gitlab.updateIssue(a.work_item_iid, {
+              description: writeAgentMeta(desc, { ...(parsed.meta ?? {}), needs }),
+            });
+          } else {
+            await gitlab.updateIssue(a.work_item_iid, { description: desc });
+          }
+          const w = await syncStatus(a.work_item_iid, 'needs-you');
+          if (w) warnings.push(w);
+        } else if (cur === 'needs-you') {
+          status = 'working';
+          const desc = removeBlock(issue.description ?? '', NEEDS_MARKER);
+          if (!parsed.corrupt && !parsed.tooNew) {
+            const { needs: _drop, ...rest } = parsed.meta ?? {};
+            await gitlab.updateIssue(a.work_item_iid, { description: writeAgentMeta(desc, rest) });
+          } else {
+            await gitlab.updateIssue(a.work_item_iid, { description: desc });
+          }
+          const w = await syncStatus(a.work_item_iid, 'working');
+          if (w) warnings.push(w);
+        }
+      } catch (err) {
+        warnings.push(`⚠️ Comment đã ghi nhưng không đổi được cột (${/** @type {Error} */ (err).message}).`);
+      }
+      return ok({ posted: true, status, warnings });
     },
 
     task_attach_docs: attachDocs,
@@ -924,16 +1087,26 @@ export function createHandlers(deps) {
       const issue = await gitlab.getIssue(a.work_item_iid);
       const parsed = parseAgentMeta(issue.description ?? '');
 
-      // Đường ghi cho hai trường mà validateComplete GÁC nhưng trước 0.1.11 không tool nào ghi
-      // được: `hazard` (cổng care::chat) và `review_evidence` (cổng review::required). Cổng đọc một
-      // trường không ai ghi nổi thì không phải kỷ luật, mà là bế tắc — item kẹt tới hết TTL.
-      //
+      // Meta hỏng/mới hơn ⇒ DỪNG trước khi làm bất cứ gì. Đi tiếp thì (a) meta hỏng bị thay bằng
+      // {} và mất im lặng hazard/acceptance/history; (b) meta mới hơn làm writeAgentMeta ném SAU khi
+      // đã tạo issue nợ ⇒ gọi lại sinh issue nợ trùng.
+      if (parsed.corrupt) {
+        return toolError(
+          `Khối agent-meta trên #${a.work_item_iid} HỎNG (JSON không đọc được) — KHÔNG complete để tránh ` +
+            `xoá mất hazard/acceptance/history. Sửa tay khối agent-meta trong description rồi gọi lại.`,
+        );
+      }
+      if (parsed.tooNew) {
+        return toolError(
+          `Khối agent-meta trên #${a.work_item_iid} ở phiên bản mới hơn bản server này hiểu — nâng cấp ` +
+            `agent-tasks rồi gọi lại. Chưa ghi gì.`,
+        );
+      }
+
       // Chỉ ghi đè khi giá trị mới CÓ nội dung: `hazard: "  "` không được phép xoá lời khai cũ rồi
       // làm chính lệnh này tự chặn mình.
       const metaNow = { ...(parsed.meta ?? {}) };
-      // `tradeoff` và `debt` đi CÙNG ĐƯỜNG với hazard: chỉ ghi khi có nội dung, để một lời gọi
-      // truyền chuỗi rỗng không xoá lời khai của lượt trước rồi làm chính cổng này tự chặn mình.
-      for (const field of ['hazard', 'review_evidence', 'tradeoff', 'debt']) {
+      for (const field of ['hazard', 'review_evidence', 'tradeoff']) {
         const declared = String(a[field] ?? '').trim();
         if (declared) metaNow[field] = declared;
       }
@@ -948,84 +1121,250 @@ export function createHandlers(deps) {
       }
 
       const stamp = new Date(now()).toISOString();
-      const meta = {
-        ...metaNow,
-        spec_delta: a.spec_delta,
-        risk_declared: a.risk_declared ?? null,
-        observe: a.observe ?? 'l0',
-        links: { ...(parsed.meta?.links ?? {}), mr: a.mr_url ?? null },
-        history: [...(parsed.meta?.history ?? []), { at: stamp, event: 'completed' }],
+      const debts = normalizeDebt(a.debt);
+      const qcSteps = Array.isArray(a.qc_steps) ? a.qc_steps.map((s) => String(s).trim()).filter(Boolean) : [];
+      const qc = {
+        steps: qcSteps,
+        not_manual: String(a.qc_not_manual ?? '').trim() || null,
+        evidence: String(a.qc_evidence ?? '').trim() || null,
       };
 
-      // Khối NGƯỜI ĐỌC đi trước khối meta trong CÙNG một lượt ghi: `upsertBlock` rồi
-      // `writeAgentMeta`. Thứ tự này bắt buộc — `writeAgentMeta` cắt mọi thứ SAU khối meta, nên
-      // chèn khối outcome sau nó là tự xoá khối vừa viết (lỗi #2 ở đầu desc-block.mjs).
-      const withOutcome = upsertBlock(
-        issue.description ?? '',
-        OUTCOME_MARKER,
-        renderOutcomeBlock({
-          summary: a.summary,
-          spec_delta: a.spec_delta,
-          tradeoff: metaNow.tradeoff,
-          debt: metaNow.debt,
-          risk: a.risk_declared,
-          hazard: metaNow.hazard,
-          gate: parseLabels(issue.labels ?? []).scoped.gate ?? null,
-          gate_waiver: a.gate_waiver,
-          mr: a.mr_url,
-          at: stamp,
-        }),
-      );
-
-      await gitlab.updateIssue(a.work_item_iid, {
-        description: writeAgentMeta(withOutcome, meta),
-      });
-
-      // Hai nhãn PHẢI ghi ngay đây, không ở lượt sau: sau `syncStatus` là `claims.release`, và
-      // sau khi nhả claim thì agent không còn quyền ghi lên item. Đây là lượt cuối nó ghi được.
-      const addFlags = [];
-      if (String(metaNow.debt ?? '').trim()) addFlags.push('debt');
-      if (Array.isArray(a.spec_delta) && a.spec_delta.length) addFlags.push('spec-changed');
-      /** @type {string[]} */ const flagWarnings = [];
-      if (addFlags.length) {
+      // ── Nợ ⇒ ISSUE MỚI trong Backlog (docs/11 §C6). Tạo TRƯỚC khi ghi khối Kết quả để có iid mà link.
+      // MỘT phần tử cho MỖI khoản, kể cả khi tạo lỗi (null) — khối Kết quả map theo vị trí, lệch
+      // một chỗ là người QC bấm vào link đọc nhầm việc.
+      /** @type {({iid: number, title: string, web_url: string|null}|null)[]} */ const debtIssues = [];
+      /** @type {string[]} */ const warnings = [];
+      for (const d of debts) {
         try {
-          await gitlab.updateIssue(a.work_item_iid, { add_labels: addFlags.join(',') });
+          const dMeta = {
+            v: META_VERSION,
+            source: { kind: 'debt', path: null, hash: contentHash(`${issue.iid}:${d.title}`), slug: slugify(d.title), parent_iid: issue.iid },
+            shape: null, care: null, hazard: null, role_hint: null,
+            goal: `Trả nợ kỹ thuật để lại từ #${issue.iid} (${issue.title}).`,
+            scope: [], out_of_scope: [],
+            acceptance: [d.detail ? `Đã làm: ${d.detail}` : `Đã trả nợ "${d.title}"`],
+            spec_delta: [], risk_declared: null, review_required: false, ingest_run: null,
+            links: { parent: issue.web_url ?? null },
+            history: [{ at: stamp, event: 'created', by: identity?.owner ?? null, from: `#${issue.iid}` }],
+          };
+          const body =
+            `## 💳 Nợ kỹ thuật · từ #${issue.iid}\n\n` +
+            `**Việc phải làm:** ${d.title}\n\n` +
+            (d.detail ? `**Ở đâu / vì sao để lại / trả thì làm gì**\n\n${d.detail}\n\n` : '') +
+            `_Sinh ra bởi task_complete của #${issue.iid} lúc ${stampOf(now())}. Bóc như một việc thường trong Backlog._`;
+          const created = await gitlab.createIssue({
+            title: d.title,
+            description: writeAgentMeta(upsertBlock('', REQUEST_MARKER, body), dMeta),
+            labels: [labelFor('status', 'backlog'), 'debt'],
+          });
+          debtIssues.push({ iid: created.iid, title: d.title, web_url: created.web_url ?? null });
+          // Khối "Đang làm" cho issue nợ: chưa ai nhận. Lỗi ở đây chỉ là hiển thị.
+          warnings.push(...(await syncWho(created.iid, null, 'backlog', created.description)).warnings);
         } catch (err) {
-          // Nhãn là mặt hiển thị, không phải nguồn sự thật — nhưng mất nó thì recap không đếm
-          // được nợ còn mở, nên phải NÓI RA thay vì nuốt.
-          flagWarnings.push(
-            `⚠️ Không gắn được nhãn ${addFlags.join(', ')} (${/** @type {Error} */ (err).message}). ` +
-              `Trường trong agent-meta VẪN ĐÚNG; gắn tay nhãn đó để bản recap đếm được.`,
+          debtIssues.push(null);
+          warnings.push(
+            `⚠️ Không tạo được issue nợ "${d.title}" (${/** @type {Error} */ (err).message}). ` +
+              `Khoản nợ này CHỈ còn trong khối Kết quả của #${issue.iid} — tạo tay một issue Backlog nhãn debt.`,
           );
         }
       }
-      await gitlab.createNote(a.work_item_iid, `✅ Agent báo xong:\n\n${a.summary}`);
-      await syncStatus(a.work_item_iid, 'review');
+      const createdDebt = debtIssues.filter((d) => d !== null);
 
-      // Nhắc TRƯỚC khi nhả claim — sau đó agent không ghi được nữa nên nhắc mới có tác dụng.
-      const warnings = [...docsWarnings(issue.description), ...flagWarnings];
-      claims.release(keyOf(a.work_item_iid), a.claim_token);
+      // Gọi complete lần hai (claim lại sau khi QC trả về) mà không truyền `debt` ⇒ GIỮ nợ và link
+      // issue nợ đã tạo lần trước, không xoá.
+      const prevDebtIssues = Array.isArray(parsed.meta?.links?.debt_issues) ? parsed.meta.links.debt_issues : [];
+      const meta = {
+        ...metaNow,
+        spec_delta: Array.isArray(a.spec_delta) ? a.spec_delta : [],
+        risk_declared: a.risk_declared ?? null,
+        qc,
+        debt: debts.length ? debts : (a.debt === undefined ? (parsed.meta?.debt ?? null) : null),
+        links: {
+          ...(parsed.meta?.links ?? {}),
+          mr: a.mr_url ?? parsed.meta?.links?.mr ?? null,
+          debt_issues: [...prevDebtIssues, ...createdDebt.map((d) => d.iid)],
+        },
+        history: [...(parsed.meta?.history ?? []), { at: stamp, event: 'completed', by: identity?.owner ?? null }],
+      };
+      // Khối "Cần bạn" (nếu còn) hết lý do tồn tại.
+      delete meta.needs;
 
-      return ok({ completed: true, status: 'review', labels_added: addFlags, warnings });
+      // Khối NGƯỜI ĐỌC đi trước khối meta trong CÙNG một lượt ghi: `upsertBlock` rồi `writeAgentMeta`.
+      // Thứ tự này bắt buộc — `writeAgentMeta` cắt mọi thứ SAU khối meta.
+      const withOutcome = upsertBlock(
+        removeBlock(issue.description ?? '', NEEDS_MARKER),
+        OUTCOME_MARKER,
+        renderOutcomeBlock({
+          summary: a.summary,
+          qc,
+          spec_delta: meta.spec_delta,
+          tradeoff: metaNow.tradeoff,
+          debts: debts.map((d, i) => ({ ...d, iid: debtIssues[i]?.iid ?? null, web_url: debtIssues[i]?.web_url ?? null })),
+          risk: a.risk_declared,
+          hazard: metaNow.hazard,
+          gate: gateStatusOf({ labels: issue.labels, meta: metaNow }),
+          gate_waiver: a.gate_waiver,
+          mr: meta.links.mr,
+          at: stamp,
+        }),
+      );
+      const withWho = upsertBlock(withOutcome, WHO_MARKER, renderWhoBlock(null, 'in-review'), { position: 'top' });
+
+      await gitlab.updateIssue(a.work_item_iid, { description: writeAgentMeta(withWho, meta) });
+
+      await gitlab.createNote(
+        a.work_item_iid,
+        `✅ Agent báo xong — chờ QC:\n\n${a.summary}\n\n` +
+          (qcSteps.length
+            ? `**Cách kiểm**\n${qcSteps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+            : `_Không kiểm tay được: ${qc.not_manual}_${qc.evidence ? `\nBằng chứng: ${qc.evidence}` : ''}`) +
+          (createdDebt.length ? `\n\nNợ để lại → ${createdDebt.map((d) => `#${d.iid}`).join(', ')}` : ''),
+      );
+      const w = await syncStatus(a.work_item_iid, 'in-review');
+      if (w) warnings.push(w);
+      if (typeof gitlab.setAssignees === 'function') {
+        try {
+          await gitlab.setAssignees(a.work_item_iid, []);
+        } catch {
+          /* assignee là hiển thị, không chặn */
+        }
+      }
+
+      // Nhắc TRƯỚC khi nhả claim — sau đó agent không ghi được nữa.
+      warnings.push(...docsWarnings(issue.description));
+      const rel = claims.release(keyOf(a.work_item_iid), a.claim_token);
+      if (!rel?.ok) {
+        warnings.push(
+          `⚠️ Item đã sang In review nhưng KHÔNG nhả được claim (${rel?.message ?? rel?.reason ?? 'lỗi không rõ'}). ` +
+            `Ref còn sống ⇒ phiên khác không giành lại được cho tới khi hết TTL hoặc tasks_doctor --fix.`,
+        );
+      }
+
+      return ok({
+        completed: true,
+        status: 'in-review',
+        debt_issues: createdDebt,
+        warnings,
+      });
     },
 
     async task_block(a) {
       const bad = await requireClaim(a.work_item_iid, a.claim_token);
       if (bad) return bad;
 
-      // Đọc description TRƯỚC khi ghi note, để biết tài liệu đã đính chưa.
-      // task_block cũng nhả claim y như complete ⇒ nó cũng là mốc ra (spec D11).
       const issue = await gitlab.getIssue(a.work_item_iid);
       const warnings = docsWarnings(issue.description);
+      const kind = NEEDS_KIND.includes(a.kind) ? a.kind : 'blocked';
+      const at = now();
+      const needs = {
+        kind, reason: a.reason, needs: a.needs ?? null, at: new Date(at).toISOString(), holding: false,
+      };
 
       await gitlab.createNote(
         a.work_item_iid,
-        `⛔ Bế tắc: ${a.reason}\n\nCần gì để gỡ: ${a.needs ?? '(chưa nêu)'}`,
+        `🙋 Cần bạn (${kind}): ${a.reason}\n\nBạn cần làm gì: ${a.needs ?? '(agent chưa nêu)'}`,
       );
-      await gitlab.updateIssue(a.work_item_iid, { add_labels: 'needs-advice' });
-      await syncStatus(a.work_item_iid, 'blocked');
-      claims.release(keyOf(a.work_item_iid), a.claim_token);
-      return ok({ blocked: true, warnings });
+
+      // Khối "Cần bạn" ở đầu + khối "Đang làm" đổi sang "cần bạn". Meta ghi `needs` để Orchestrator đọc.
+      try {
+        const parsed = parseAgentMeta(issue.description ?? '');
+        let desc = upsertBlock(
+          issue.description ?? '',
+          NEEDS_MARKER,
+          renderNeedsBlock({ ...needs, by: identity?.owner ?? 'agent' }),
+          { position: 'top' },
+        );
+        desc = upsertBlock(desc, WHO_MARKER, renderWhoBlock(null, 'needs-you'), { position: 'top' });
+        if (!parsed.corrupt && !parsed.tooNew) {
+          desc = writeAgentMeta(desc, {
+            ...(parsed.meta ?? {}),
+            needs,
+            history: [...(parsed.meta?.history ?? []), { at: needs.at, event: 'blocked', kind, by: identity?.owner ?? null }],
+          });
+        }
+        await gitlab.updateIssue(a.work_item_iid, { description: desc });
+      } catch (err) {
+        warnings.push(`⚠️ Không ghi được khối "Cần bạn" (${/** @type {Error} */ (err).message}) — comment vẫn có.`);
+      }
+      if (typeof gitlab.setAssignees === 'function') {
+        try {
+          await gitlab.setAssignees(a.work_item_iid, []);
+        } catch {
+          /* hiển thị */
+        }
+      }
+
+      const w = await syncStatus(a.work_item_iid, 'needs-you');
+      if (w) warnings.push(w);
+      const rel = claims.release(keyOf(a.work_item_iid), a.claim_token);
+      if (!rel?.ok) {
+        warnings.push(
+          `⚠️ Item đã sang Needs you nhưng KHÔNG nhả được claim (${rel?.message ?? rel?.reason ?? 'lỗi không rõ'}). ` +
+            `Ref còn sống ⇒ người giao lại sẽ bị chặn cho tới khi hết TTL hoặc tasks_doctor --fix.`,
+        );
+      }
+      return ok({ blocked: true, status: 'needs-you', kind, warnings });
+    },
+
+    /**
+     * Đóng issue khi NGƯỜI đã ok (docs/11 §C12/C7). Không đòi claim_token: claim đã nhả từ lúc
+     * complete, và bắt claim lại chỉ để đóng là nghi thức. Đổi lại, tool kiểm ba thứ: item đang ở
+     * cột chờ người (in-review / ready-to-merge), không ai khác đang giữ, và có tên người đã ok.
+     */
+    async task_close(a) {
+      const approvedBy = String(a.approved_by ?? '').trim();
+      if (!approvedBy) {
+        return toolError(
+          'task_close cần `approved_by`: ai đã ok (nguyên văn). Không có ok của người thì KHÔNG đóng — ' +
+            'để item ở Ready to merge cho người tự merge.',
+        );
+      }
+      const issue = await gitlab.getIssue(a.work_item_iid);
+      if (issue.state === 'closed') return ok({ closed: true, already: true });
+
+      const { scoped } = parseLabels(issue.labels ?? []);
+      if (!['in-review', 'ready-to-merge'].includes(scoped.status)) {
+        return toolError(
+          `#${a.work_item_iid} đang ở cột "${STATUS_HUMAN[scoped.status] ?? scoped.status ?? 'không rõ'}", ` +
+            `không phải In review / Ready to merge. Chỉ đóng việc đã qua QC. Đang làm thì task_complete trước.`,
+        );
+      }
+      // Chỉ claim CÒN SỐNG của người khác mới chặn; ref quá hạn của một agent đã chết không được
+      // giữ issue mở vĩnh viễn cho tới khi ai đó chạy doctor.
+      const held = claims.list().find((x) => x.item === keyOf(a.work_item_iid));
+      const heldAlive = held && !isExpired(held, now(), cfg.skewSec ?? 60, cfg.graceSec ?? 120);
+      if (heldAlive && held.owner_id !== claims.ownerId) {
+        return toolError(
+          `#${a.work_item_iid} đang được ${held.owner}@${held.host ?? '?'} giữ tới ${held.expires_at} — ` +
+            'không đóng việc người khác đang làm. Hỏi họ trước.',
+        );
+      }
+
+      const stamp = new Date(now()).toISOString();
+      /** @type {string[]} */ const warnings = [];
+      const merged = String(a.merged_ref ?? '').trim();
+      await gitlab.createNote(
+        a.work_item_iid,
+        `🏁 Đóng theo ok của **${approvedBy}**${merged ? ` · đã land: ${merged}` : ''}` +
+          (a.note ? `\n\n${a.note}` : ''),
+      );
+      try {
+        const parsed = parseAgentMeta(issue.description ?? '');
+        let desc = upsertBlock(issue.description ?? '', WHO_MARKER, renderWhoBlock(null, 'closed'), { position: 'top' });
+        if (!parsed.corrupt && !parsed.tooNew) {
+          desc = writeAgentMeta(desc, {
+            ...(parsed.meta ?? {}),
+            links: { ...(parsed.meta?.links ?? {}), ...(merged ? { merged } : {}) },
+            history: [...(parsed.meta?.history ?? []), { at: stamp, event: 'closed', approved_by: approvedBy, by: identity?.owner ?? null }],
+          });
+        }
+        await gitlab.updateIssue(a.work_item_iid, { description: desc });
+      } catch (err) {
+        warnings.push(`⚠️ Không ghi được dấu vết đóng vào description (${/** @type {Error} */ (err).message}).`);
+      }
+      await gitlab.closeIssue(a.work_item_iid);
+      if (held && held.owner_id === claims.ownerId) claims.release(keyOf(a.work_item_iid), held.claim_token);
+      return ok({ closed: true, approved_by: approvedBy, merged_ref: merged || null, warnings });
     },
 
     async tasks_my_claims() {
@@ -1040,35 +1379,21 @@ export function createHandlers(deps) {
       });
     },
 
-    /**
-     * Recap N ngày — xem lib/recap.mjs cho luật gộp. Ở đây chỉ có phần MẠNG.
-     *
-     * HAI truy vấn, và cái thứ hai không phải tuỳ chọn:
-     *   1. cửa sổ thời gian (`updated_after`) — thứ "đã xảy ra trong kỳ".
-     *   2. nhãn `debt` + `state=opened` — nợ kỹ thuật là thứ TÍCH LUỸ. Chỉ báo nợ ghi trong 7
-     *      ngày thì bức tranh nợ luôn nhỏ hơn thực tế, và đó đúng là con số người ta dùng để
-     *      quyết định "kỳ tới trả nợ hay làm tính năng". Đây cũng là lý do `debt` phải là NHÃN
-     *      chứ không chỉ một trường trong meta: truy vấn này rẻ vì server lọc được.
-     */
     async tasks_recap(a = {}) {
-      // Cùng MỘT hàm chuẩn hoá với buildRecap — nếu không, `updated_after` của truy vấn và cửa sổ
-      // của báo cáo có thể là hai khoảng khác nhau, im lặng.
       const days = normalizeDays(a.days);
       const nowMs = now();
       const sinceIso = new Date(nowMs - days * 86_400_000).toISOString();
       /** @type {string[]} */ const warnings = [];
 
-      // `state: 'all'` cố ý: item đã đóng vẫn là thay đổi đã xảy ra trong kỳ, và bỏ chúng đi thì
-      // recap kể thiếu đúng những việc đã hoàn tất gọn gàng nhất.
       const issues = await gitlab.listAllIssues({
         updatedAfter: sinceIso, state: 'all', perPage: SCAN_PER_PAGE,
       });
 
+      // Nợ là thứ TÍCH LUỸ: truy vấn riêng, mọi thời điểm. v0.3: nhãn `debt` nằm trên ISSUE NỢ.
       /** @type {object[]|null} */ let openDebt = null;
       try {
         openDebt = await gitlab.listIssues({ labels: ['debt'], state: 'opened', perPage: SCAN_PER_PAGE });
       } catch (err) {
-        // `null` ≠ `[]`: một truy vấn lỗi KHÔNG được hiện thành "không còn nợ nào".
         warnings.push(
           `Không truy vấn được nhãn \`debt\` (${/** @type {Error} */ (err).message}) — ` +
             `phần "nợ còn mở" của bản recap này KHÔNG có dữ liệu, không phải bằng 0.`,
@@ -1077,8 +1402,6 @@ export function createHandlers(deps) {
 
       const r = buildRecap({ issues, openDebtIssues: openDebt, root, days, nowMs });
 
-      // structuredContent giữ phần ĐẾM ĐƯỢC; văn xuôi dài đã nằm trong markdown nên không nhân
-      // bản vào đây — hai bản của cùng một đoạn text là hai bản sẽ lệch nhau.
       return ok(
         {
           window: r.window,
@@ -1095,6 +1418,7 @@ export function createHandlers(deps) {
             in_flight: r.now.in_flight.length,
             waiting: r.now.waiting.length,
             blocked: r.now.blocked.length,
+            ready_to_merge: r.now.ready_to_merge.length,
           },
           silent: r.silent,
           warnings,
@@ -1104,13 +1428,12 @@ export function createHandlers(deps) {
     },
 
     async tasks_doctor(a = {}) {
-      const issues = await gitlab.listIssues({ labels: [labelFor('status', 'claimed')], state: 'opened', perPage: 100 });
+      const issues = await gitlab.listIssues({ labels: [labelFor('status', 'working')], state: 'opened', perPage: 100 });
       const held = new Map(claims.list().map((c) => [c.item, c]));
       const findings = [];
 
-      // Nhãn claimed mà không có ref ⇒ agent đã chết. Không hạ nhãn thì item KẸT VĨNH VIỄN:
-      // task_claim_next chỉ lọc status::ready nên nó không bao giờ là ứng viên nữa, và đường
-      // reclaim trong acquire() không với tới được qua hàng đợi (docs/05 §9 hàng 2).
+      // Nhãn working mà không có ref ⇒ agent đã chết. Không hạ nhãn thì item KẸT VĨNH VIỄN:
+      // task_claim_next chỉ lọc backlog nên nó không bao giờ là ứng viên nữa.
       const graceMs = (cfg.graceSec ?? 120) * 2 * 1000;
       for (const i of issues) {
         if (held.has(keyOf(i.iid))) continue;
@@ -1119,11 +1442,12 @@ export function createHandlers(deps) {
         const ripe = Number.isFinite(staleFor) ? staleFor > graceMs : true;
         const f = {
           kind: 'label-without-claim', iid: i.iid,
-          note: `nhãn claimed nhưng không có claim ref${ripe ? '' : ' (chờ hết grace rồi mới hạ)'}`,
+          note: `nhãn Working nhưng không có claim ref${ripe ? '' : ' (chờ hết grace rồi mới hạ)'}`,
         };
         if (a.fix && ripe) {
-          await syncStatus(i.iid, 'ready');
-          await gitlab.createNote(i.iid, '🩺 doctor: claim đã chết, trả item về hàng đợi.');
+          await syncStatus(i.iid, 'backlog');
+          await syncWho(i.iid, null, 'backlog');
+          await gitlab.createNote(i.iid, '🩺 doctor: claim đã chết, trả item về Backlog.');
           f.fixed = true;
         }
         findings.push(f);
@@ -1131,34 +1455,29 @@ export function createHandlers(deps) {
       for (const c of held.values()) {
         const iid = Number(String(c.item).split('#')[1]);
         const issue = issues.find((x) => x.iid === iid);
-        if (!issue) findings.push({ kind: 'claim-without-label', iid, note: 'có claim ref nhưng nhãn không phải claimed' });
+        if (!issue) findings.push({ kind: 'claim-without-label', iid, note: 'có claim ref nhưng nhãn không phải Working' });
       }
-      // Cùng MỘT định nghĩa hết hạn cho báo cáo và cho --fix. Lệch nhau thì người vận hành
-      // chạy --fix mãi mà finding vẫn còn (item quá hạn 1 giây bị liệt kê nhưng chưa dọn).
       const expired = a.fix
         ? claims.reclaimExpired()
         : claims.list().filter((c) => isExpired(c, now(), cfg.skewSec ?? 60, cfg.graceSec ?? 120));
       for (const c of expired) findings.push({ kind: 'expired-claim', item: c.item, fixed: Boolean(a.fix) });
 
-      return ok({ findings, count: findings.length, fixed: Boolean(a.fix) });
-    },
-
-    // `tasks_ingest` đã RA khỏi mặt MCP ở v0.2 — đường duy nhất còn lại là `tasks-cli ingest`
-    // (lý do đầy đủ ở đầu lib/tool-defs.mjs). Handler cũng phải đi cùng: test "có handler cho
-    // ĐÚNG tập tool đã khai — không thừa, không thiếu" sẽ đỏ nếu để lại một handler không có
-    // đường gọi, và nó đỏ ĐÚNG — handler không ai route tới chính là định nghĩa của tool chết.
-
-    async tasks_probe_capabilities(a = {}) {
-      // Message phải nói được làm gì tiếp, chứ "chưa sẵn sàng" trơn thì agent không biết đây là
-      // lỗi cấu hình, lỗi quyền, hay tool chưa được nối.
-      if (!deps.probe) {
-        return toolError(
-          'Probe chưa được nối vào runtime này — không phải lỗi cấu hình của bạn. Chạy tay được: ' +
-            '`node bin/tasks-cli.mjs probe`. Nếu vẫn không chạy, báo lại: lib/runtime.mjs phải ' +
-            'truyền `probe` vào createHandlers.',
-        );
+      // v0.3: item còn mang nhãn v0.2 (`status::ready`, `care::chat`, `gate::*`…) ⇒ nhắc dọn.
+      // Chỉ báo, không sửa ở đây: dọn hàng loạt là việc của `tasks-cli labels --migrate`.
+      try {
+        const opened = await gitlab.listIssues({ state: 'opened', perPage: 100 });
+        const stale = (opened ?? []).filter((i) => !migrationPlan(i.labels ?? []).noop);
+        if (stale.length) {
+          findings.push({
+            kind: 'legacy-labels', count: stale.length, iids: stale.map((i) => i.iid).slice(0, 20),
+            note: `${stale.length} item còn nhãn v0.2 — dọn bằng \`tasks-cli labels --migrate --apply\``,
+          });
+        }
+      } catch {
+        /* chẩn đoán phụ, không chặn */
       }
-      return ok(await deps.probe.run(a));
+
+      return ok({ findings, count: findings.length, fixed: Boolean(a.fix) });
     },
   };
 }
@@ -1166,17 +1485,9 @@ export function createHandlers(deps) {
 /**
  * Khối "Kết quả" — bản NGƯỜI ĐỌC của một item vừa xong. Ghi bởi `task_complete`.
  *
- * Vì sao cần, dù mọi trường đã ở trong agent-meta: người audit không đọc JSON, và bốn tệp `.md`
- * đính kèm thì GitLab không render. Trước v0.2, đường đọc của người là "mở item → thấy một hộp
- * JSON và bốn link tải file". Khối này trả lời ba câu người thật sự hỏi — **đã đổi gì · vì sao ·
- * còn nợ gì** — ngay trên trang, không phải tải gì.
- *
- * Mục nào KHÔNG được khai thì in `_không khai_` chứ không bỏ mục đi: một mục vắng mặt trông
- * giống "việc này không có phần đó", còn `_không khai_` nói đúng sự thật là **không ai ghi**.
- * Đó là khác biệt mà bản recap N ngày đếm được ở mục "Chỗ KHÔNG có dấu vết".
- *
- * @param {{summary?:string, spec_delta?:object[], tradeoff?:string, debt?:string, risk?:string,
- *          hazard?:string, gate?:string|null, gate_waiver?:string, mr?:string, at:string}} o
+ * v0.3: thứ tự theo câu hỏi của NGƯỜI QC — **kiểm thế nào** đứng đầu, rồi đã làm gì, bằng chứng
+ * máy, đánh đổi, nợ (link issue), MR. Mục nào KHÔNG được khai thì in `_không khai_` chứ không bỏ
+ * mục đi: một mục vắng mặt trông giống "việc này không có phần đó".
  */
 export function renderOutcomeBlock(o) {
   const t = (v) => String(v ?? '').trim();
@@ -1184,28 +1495,49 @@ export function renderOutcomeBlock(o) {
   const sd = Array.isArray(o.spec_delta) ? o.spec_delta : [];
   const L = [`## ✅ Kết quả · ${stamp}`, ''];
 
-  L.push('**Đã làm gì**', '', t(o.summary) || '_không khai_', '');
-
-  L.push('**Đổi hành vi quan sát được**', '');
-  if (sd.length) {
-    L.push('| capability | | requirement |', '|---|---|---|');
-    for (const d of sd) {
-      L.push(`| \`${t(d?.capability) || '?'}\` | ${t(d?.op) || '?'} | ${t(d?.requirement) || '?'} |`);
-    }
+  L.push('### 🧪 Cách kiểm (QC)', '');
+  const steps = Array.isArray(o.qc?.steps) ? o.qc.steps.filter(Boolean) : [];
+  if (steps.length) {
+    for (const [i, s] of steps.entries()) L.push(`${i + 1}. ${s}`);
+  } else if (t(o.qc?.not_manual)) {
+    L.push(`_Không kiểm tay được:_ ${t(o.qc.not_manual)}`);
+    if (t(o.qc?.evidence)) L.push('', `**Bằng chứng máy:** ${t(o.qc.evidence)}`);
   } else {
-    L.push('Không đổi hành vi quan sát được.');
+    L.push('_không khai_');
   }
   L.push('');
 
+  L.push('**Đã làm gì**', '', t(o.summary) || '_không khai_', '');
+
+  if (sd.length) {
+    L.push('**Đổi hành vi quan sát được**', '', '| capability | | requirement |', '|---|---|---|');
+    for (const d of sd) {
+      L.push(`| \`${t(d?.capability) || '?'}\` | ${t(d?.op) || '?'} | ${t(d?.requirement) || '?'} |`);
+    }
+    L.push('');
+  }
+
+  const gate = o.gate === 'green' ? '✅ xanh' : o.gate === 'red' ? '❌ ĐỎ' : '· không có ledger / chưa chạy';
+  L.push(`**Gate (bằng chứng máy):** ${gate}${t(o.gate_waiver) ? ` — ${t(o.gate_waiver)}` : ''}`, '');
+
   L.push('**Vì sao / đánh đổi**', '', t(o.tradeoff) || '_không khai_', '');
-  L.push('**Nợ để lại**', '', t(o.debt) || '_không khai_', '');
+
+  L.push('**Nợ để lại**', '');
+  const debts = Array.isArray(o.debts) ? o.debts : [];
+  if (debts.length) {
+    for (const d of debts) {
+      const link = d.iid ? (d.web_url ? `[#${d.iid}](${d.web_url})` : `#${d.iid}`) : '_(chưa tạo được issue)_';
+      L.push(`- ${link} ${t(d.title)}${t(d.detail) ? ` — ${t(d.detail)}` : ''}`);
+    }
+    L.push('', '_Mỗi khoản là một issue riêng trong Backlog (nhãn `debt`)._');
+  } else {
+    L.push('Không có.');
+  }
+  L.push('');
 
   if (t(o.hazard)) L.push('**Hazard**', '', `⚠️ ${t(o.hazard)}`, '');
-  if (t(o.risk)) L.push('**Rủi ro cần soi**', '', t(o.risk), '');
-
-  const gate = o.gate === 'green' ? '✅ xanh' : o.gate === 'red' ? '❌ ĐỎ' : '· chưa chạy';
-  L.push(`**Gate**: ${gate}${t(o.gate_waiver) ? ` — miễn trừ: ${t(o.gate_waiver)}` : ''}`);
-  if (t(o.mr)) L.push('', `**MR**: ${t(o.mr)}`);
+  if (t(o.risk)) L.push('**Chỗ chưa chắc — QC soi kỹ**', '', t(o.risk), '');
+  if (t(o.mr)) L.push(`**MR**: ${t(o.mr)}`);
 
   return L.join('\n');
 }
@@ -1214,13 +1546,10 @@ export function renderOutcomeBlock(o) {
  * Dựng khối tài liệu cho description: bảng link + tóm tắt gate.
  *
  * Vì sao có CẢ HAI: file .md upload lên GitLab KHÔNG được render (click là tải raw), nên chỉ có
- * bảng link thì QC phải tải 4 file mới đọc được. Tóm tắt render ngay giải quyết đúng chỗ đó
- * (spec D1).
+ * bảng link thì QC phải tải 4 file mới đọc được. Tóm tắt render ngay giải quyết đúng chỗ đó.
  */
 export function renderDocsBlock(docs, ev, nowMs) {
-  // Ghi rõ UTC: toISOString là UTC, và một lần chạy 13:15 giờ VN hiện thành "06:15" — không ghi
-  // múi giờ thì người đọc tưởng đó là giờ máy mình và kết luận sai về thời điểm đính.
-  const stamp = `${new Date(nowMs).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  const stamp = stampOf(nowMs);
   const LABEL = { spec: 'spec', ledger: 'ledger', handoff: 'handoff QC', api_spec: 'api spec' };
 
   const rows = docs
@@ -1236,7 +1565,7 @@ export function renderDocsBlock(docs, ev, nowMs) {
       ? ev.commands.map((c) => `- \`${c.cmd}\` → exit ${c.exit}${c.exit === 0 ? ' ✅' : ' ❌'}`).join('\n')
       : '_không có lệnh gate nào được ghi_';
     out +=
-      `\n<details><summary>ledger — tóm tắt gate</summary>\n\n` +
+      `\n<details><summary>ledger — tóm tắt gate: ${ev.gateStatus === 'green' ? '✅ xanh' : '❌ đỏ'}</summary>\n\n` +
       `- HEAD: \`${ev.head ?? '(không có)'}\` · DIRTY: \`${ev.dirty ?? '—'}\`\n\n${cmds}\n` +
       (ev.missing.length ? `\n⚠️ Ledger thiếu mục: ${ev.missing.join(', ')}\n` : '') +
       `\n</details>\n`;

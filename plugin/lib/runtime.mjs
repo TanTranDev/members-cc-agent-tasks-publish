@@ -33,6 +33,23 @@ export function resolveIdentity({ root, env = process.env } = {}) {
     owner: env.AGENT_TASKS_OWNER || env.USER || env.LOGNAME || 'unknown',
     pid: process.pid,
     agentRole: env.AGENT_TASKS_ROLE || null,
+    /**
+     * v0.3: TÊN agent, để người nhìn khối "Đang làm" biết đúng agent nào (một máy chạy nhiều
+     * agent). Bỏ trống ⇒ dùng vai; không có vai ⇒ "agent".
+     */
+    agentName: env.AGENT_TASKS_AGENT_NAME || env.AGENT_TASKS_ROLE || null,
+    /**
+     * v0.3: id người dùng GitLab để set assignee lúc claim — card trên board hiện avatar.
+     * Bỏ trống ⇒ runtime thử `whoami` (token cá nhân thì ra người, group token thì ra bot và
+     * KHÔNG assign).
+     */
+    gitlabUserId: (() => {
+      const raw = String(env.AGENT_TASKS_GITLAB_USER_ID ?? '').trim();
+      if (!raw) return null;
+      const n = Number(raw);
+      // Không phải số nguyên dương ⇒ coi như KHÔNG khai (rơi về whoami), không để NaN lọt vào cache.
+      return Number.isInteger(n) && n > 0 ? n : null;
+    })(),
   };
 }
 
@@ -95,15 +112,9 @@ export function createRuntime({ cwd = process.cwd(), env = process.env } = {}) {
   const claims = createClaimEngine({ config, identity });
   const rateLimiter = createRateLimiter(config.progressMinIntervalSec);
 
-  // v0.2 KHÔNG còn nối `ingest` vào handler: `tasks_ingest` đã ra khỏi mặt MCP (lý do đầy đủ ở
-  // đầu lib/tool-defs.mjs), đường duy nhất còn lại là `tasks-cli ingest` — và CLI tự gọi
-  // `createIngestRunner` riêng. Giữ wiring ở đây sẽ để lại một runner không ai gọi, đúng thứ
-  // `tasks_probe_capabilities` từng là và là lý do __tests__/runtime-wiring.test.mjs ra đời.
-  //
-  // Thiếu dòng `probe` dưới đây thì tasks_probe_capabilities là TOOL CHẾT — model
-  // vẫn thấy nó trong danh sách, gọi vào thì luôn nhận "Probe chưa sẵn sàng".
-  // `machineDir` để probe ghi capabilities ở CẤP MÁY: capabilities là thuộc tính của instance
-  // GitLab, không của dự án — một máy nhiều dự án cùng instance thì probe một lần là đủ.
+  // `ingest` và `probe` KHÔNG nối vào handler: cả hai đã rời mặt MCP (lý do ở đầu lib/tool-defs.mjs),
+  // đường còn lại là `tasks-cli ingest` / `tasks-cli probe`, và CLI gọi runner riêng qua `rt.probe`.
+  // `machineDir` để probe ghi capabilities ở CẤP MÁY: capabilities là thuộc tính của instance GitLab.
   const probe = createProbeRunner({
     gitlab,
     config,
@@ -111,7 +122,7 @@ export function createRuntime({ cwd = process.cwd(), env = process.env } = {}) {
     machineDir: machineDir(effectiveEnv),
   });
   // `root` là bắt buộc cho task_attach_docs — nó đọc tài liệu trên đĩa.
-  const handlers = createHandlers({ cfg: config, gitlab, claims, rateLimiter, probe, root });
+  const handlers = createHandlers({ cfg: config, gitlab, claims, rateLimiter, root, identity });
 
   return {
     configured: true,

@@ -1,29 +1,39 @@
 # agent-tasks
 
-Điều phối công việc cho **nhiều phiên agent** qua work item của GitLab. Hai phiên Claude Code không
-thể nhận cùng một task — và bạn biết được *"N ngày qua source đổi gì, VÌ SAO, còn nợ gì"*.
+Board **5 cột** cho nhiều phiên agent làm việc trên GitLab, viết cho **người quản lý** đọc được:
+
+```
+Backlog  →  Working  →  Needs you  →  In review  →  Ready to merge
+chưa ai     agent đang   agent cần     bạn QC theo   bạn merge / rebase,
+nhận        làm — ghi rõ bạn: trả lời, hướng dẫn     hoặc ok cho agent
+            AI · MÁY ·   quyết định,   agent viết    đóng issue
+            AGENT        gỡ, sửa CI
+```
+
+Hai phiên agent không thể nhận cùng một task. Mỗi item nói được **ai đang làm**, **kiểm thế nào**,
+**vì sao chốt thế**, và **còn nợ gì** — nợ là issue riêng trong Backlog, không phải một nhãn.
 
 Cài xong, phiên của bạn có thêm: **15 MCP tool** · **7 skill** · **11 lệnh CLI**.
 
-> **Không phụ thuộc tech stack.** agent-tasks không đọc code của bạn. Nó cần GitLab (work item) và
-> một repo git để giữ khoá. Dự án Go, Python, Rust, Java, TypeScript, mobile… dùng y như nhau.
+> **Không phụ thuộc tech stack.** agent-tasks không đọc code của bạn. Nó cần một project GitLab
+> chứa issue board và một repo git để giữ khoá. Board **không nhất thiết** là repo code.
 
 ---
 
-## Bốn thứ nó giải
+## Sáu thứ nó giải
 
 | # | Vấn đề | Cách giải |
 |---|---|---|
 | 1 | Hai phiên agent nhận trùng một task, không ai biết cho tới lúc merge | **claim bằng git ref + CAS** (`--force-with-lease`), có TTL + heartbeat |
-| 2 | Việc xong rồi mà không ai biết *vì sao* chốt thế | trường `tradeoff` / `debt` trên item + khối **"Kết quả"** người đọc được |
-| 3 | Người mới vào dự án không biết chuyện gì đã xảy ra | `tasks_recap` — gộp 3 nguồn, kèm mục **"Chỗ KHÔNG có dấu vết"** |
-| 4 | Board đầy nhãn mà người quản lý không xử lý được gì | **13 nhãn**, mỗi nhãn trả lời một câu hỏi của người |
+| 2 | Không biết ai đang giữ task | khối **"Đang làm"** ở đầu item: người · máy · agent · hết hạn lúc nào (+ assignee nếu có user id) |
+| 3 | Task lên review mà không biết kiểm thế nào | `task_complete` **từ chối** khi thiếu **hướng dẫn QC** — bước làm → thấy gì. Không kiểm tay được mới thay bằng bằng chứng máy |
+| 4 | Nhãn `debt` mọc khắp nơi, không ai bóc | mỗi khoản nợ ⇒ **một issue mới** ở Backlog, nhãn `debt`, link về task gốc |
+| 5 | Title issue là câu chat dán vào | `task_intake` đòi `title` + `acceptance`; skill `task-new` bắt agent **phỏng vấn** người trước |
+| 6 | Board đầy nhãn từ vựng quy trình | **10 nhãn**: 5 cột + 5 hành động của người. Không còn `care::chat`, `gate::`, `observe`, `needs-advice` |
 
 **Vì sao claim không dùng nhãn GitLab**: nhãn là *mặt hiển thị* — hai phiên có thể cùng gắn
-`status::claimed` mà không ai biết. Claim là một git ref ghi bằng `--force-with-lease`, tức
+`status::working` mà không ai biết. Claim là một git ref ghi bằng `--force-with-lease`, tức
 compare-and-swap thật: hai phiên giành cùng lúc thì **đúng một** phiên thắng.
-
-**Vì sao claim có TTL**: agent chết thì việc phải quay lại hàng đợi. Mặc định 1800s, heartbeat 600s.
 
 ---
 
@@ -36,90 +46,77 @@ claude plugin install agent-tasks@agent-tasks-marketplace
 
 Rồi **khởi động lại Claude Code**, và nói với agent: `/task-setup`.
 
-⚠️ Tên marketplace là **`agent-tasks-marketplace`** — khác tên repo. Đây là chỗ dễ gõ sai.
+⚠️ Tên marketplace là **`agent-tasks-marketplace`** — khác tên repo.
 
-**Không cần `git clone`, không cần `npm install`.** Claude Code chạy `npm ci --ignore-scripts` ngay
-trong bản copy ở cache (plugin root có `package.json` + `package-lock.json`), nên MCP server nạp được
-SDK từ đó.
-
-### Cập nhật
-
-```bash
-claude plugin update agent-tasks
-```
-
-⚠️ **Cập nhật đi theo số `version`, không theo commit.** `plugin update` so **VERSION** chứ không so
-nội dung: version không đổi thì nó báo *"already at the latest version"* rồi không làm gì. Mỗi bản
-phát hành đều bump version.
+**Không cần `git clone`, không cần `npm install`.** Cập nhật: `claude plugin update agent-tasks`
+(đi theo số `version`, mỗi bản phát hành đều bump).
 
 ---
 
-## Cấu hình: hai giá trị cho cả MÁY, một lệnh cho mỗi DỰ ÁN
-
-`/task-setup` chạy hộ toàn bộ. Muốn tự làm bằng CLI: xem [`INSTALL.md`](INSTALL.md).
+## Cấu hình: một file JSON trong repo, một token trên máy
 
 ```
-MỘT MÁY          ~/.agent-tasks/     claim-repo + token, khai MỘT LẦN
- └─ NHIỀU DỰ ÁN  .git/config         mỗi dự án tự khai backlog bằng git remote của nó
-     └─ WORK ITEM   GitLab Issue     một việc một item
-         └─ CLAIM   refs/claims/…    ai đang làm, tới khi nào
+REPO CODEBASE   agent-tasks.config.json   ← commit, cả team dùng chung
+                  boardUrl      https://git.congty.vn/nhom/agent-board   ← project chứa ISSUE BOARD
+                  claimRepoUrl  git@git.congty.vn:nhom/agent-claims.git  ← repo chỉ giữ khoá
+MỖI MÁY         ~/.agent-tasks/.env       ← GITLAB_TOKEN, không bao giờ vào repo
 ```
 
-Dự án thứ hai trở đi cần **0 file cấu hình** — `gitlabHost` + `projectPath` đọc từ git remote.
+```bash
+tasks-cli init            # sinh agent-tasks.config.json (sửa boardUrl + claimRepoUrl, commit)
+tasks-cli setup           # ~/.agent-tasks/.env — dán token
+tasks-cli verify          # 3 tiền đề: cấu hình · SSH claim-repo · token
+tasks-cli labels --apply  # 10 nhãn trên project chứa board
+tasks-cli board --apply   # 5 cột trên issue board
+```
 
-| Repo cần có | Chứa gì | Phải tạo mấy cái |
+| Repo cần có | Chứa gì | Mấy cái |
 |---|---|---|
-| **claim-repo** | chỉ **khoá**: `refs/claims/*`. Không commit, không issue | **1** cho cả team |
-| **backlog** = Issues của chính repo code | work item của riêng dự án đó | **0** — mỗi dự án đã có sẵn |
-
-claim-repo dùng chung được vì ref đã tách theo dự án: `refs/claims/<projectKey>/<hash>`. Hai dự án
-không đụng ref của nhau kể cả khi trùng số iid.
+| **project chứa board** | issue = work item, board 5 cột | 1 cho mỗi dự án — hoặc 1 dùng chung nhiều repo |
+| **claim-repo** | chỉ `refs/claims/*`. Không commit, không issue. Hiện "empty repository" là đúng | 1 cho cả team |
 
 ---
 
 ## Vòng đời một task
 
 ```
-việc MỚI   → task_intake        (dò trùng → tạo → claim)
-việc ĐÃ CÓ → task_claim_next | task_claim
+việc MỚI   → phỏng vấn người → task_intake   (title + tiêu chí → dò trùng → tạo ở Backlog → claim)
+việc ĐÃ CÓ → task_claim_next (AUTO: bóc Backlog) | task_claim (MANUAL: người giao #iid)
+                    ↓  Working — item ghi "Đang làm: ai · máy · agent"
+              LÀM VIỆC   · task_heartbeat nếu dài
+                         · cần người quyết → task_report_progress kind=question  → Needs you (giữ claim)
+                         · kẹt hẳn         → task_block                          → Needs you (nhả claim)
                     ↓
-              LÀM VIỆC   (task_heartbeat nếu dài · task_report_progress nếu bế tắc)
-                    ↓
-              task_attach_docs      ← đính tài liệu TRƯỚC
-                    ↓
-        task_complete  |  task_block
-              └── cả hai NHẢ CLAIM ──┘
+              task_attach_docs → task_complete (+ HƯỚNG DẪN QC, nợ → issue mới)   → In review
+                    ↓  NGƯỜI kiểm theo "Cách kiểm", kéo sang Ready to merge
+              người merge/rebase — hoặc ok cho agent làm rồi task_close            → đóng
 ```
 
-**Luật quan trọng nhất**: chỉ ghi lên GitLab ở **hai mốc** — lúc vào và lúc ra. Ghi liên tục làm
-activity feed thành nhiễu, và mỗi lần ghi là một lần có thể ghi sai.
+**Hai chế độ**: **Auto** — agent lặp `task_claim_next` cho tới khi Backlog hết. **Manual** — người
+chỉ đích danh *"làm #42"*. Cả hai đổ về cùng một board.
 
-**Phải đính tài liệu TRƯỚC `complete`/`block`**: cả hai nhả claim, và sau khi nhả thì không ghi được
-lên item nữa.
+**Luật quan trọng nhất**: chỉ ghi lên GitLab ở **hai mốc** — lúc vào và lúc ra. Ba cột cuối cố ý
+**không** tự đi tiếp: người là lớp phòng thủ cuối.
 
 ---
 
-## 13 nhãn — mỗi nhãn một câu hỏi của NGƯỜI
+## 10 nhãn — 5 cột + 5 hành động của NGƯỜI
 
-| Nhãn | Người thấy nó thì LÀM GÌ |
+| Nhãn | Bạn thấy nó thì LÀM GÌ |
 |---|---|
-| `status::ready` · `status::claimed` | không gì — chờ agent lấy / đang có phiên làm |
-| `status::review` | **duyệt** |
-| `status::blocked` | **gỡ** |
-| `care::chat` | đọc kỹ hơn trước khi duyệt: việc chạm thứ đắt |
-| `gate::green` · `gate::red` | red ⇒ **không duyệt** cho tới khi xanh |
-| `needs-advice` | **trả lời** để agent đi tiếp được |
-| `hotzone` | không chạy song song các item này |
-| `review::required` | đòi bằng chứng review trước khi đóng |
-| `source-drifted` | tài liệu nguồn đã đổi sau khi item được tạo — đối chiếu lại |
-| `debt` | đọc mục *Nợ để lại* trên item; xếp lịch trả |
-| `spec-changed` | có đổi hành vi quan sát được — QC test đúng chỗ đó |
+| `status::backlog` | không gì — agent sẽ bóc, hoặc giao đích danh |
+| `status::working` | không gì — đọc khối "Đang làm" nếu muốn biết ai |
+| `status::needs-you` | **đọc khối "Cần bạn"**, trả lời / quyết định, kéo về Backlog hoặc giao lại |
+| `status::in-review` | **kiểm** theo khối "Cách kiểm", đạt thì kéo sang Ready to merge |
+| `status::ready-to-merge` | **merge / rebase**, hoặc bảo agent làm rồi đóng |
+| `careful` | đọc kỹ hơn: việc chạm thứ đắt (one-way door) |
+| `hotzone` | không chạy song song các item này (bạn tự gắn) |
+| `review::required` | đòi bằng chứng review trước khi đóng (bạn tự gắn) |
+| `source-drifted` | tài liệu nguồn đã đổi sau khi tạo item — đối chiếu lại |
+| `debt` | **item này là một khoản nợ** để trả — bóc như việc thường |
 
-**VẮNG NHÃN LÀ MỘT GIÁ TRỊ**: không `care::chat` = mức thường · không `gate::*` = gate chưa chạy.
-
-`shape` · `role` · `source` · `observe` nằm trong khối `agent-meta` của item, **không** phải nhãn —
-chúng là thứ agent đọc để định tuyến, không phải thứ người xử lý. Chi tiết + đường dọn nhãn cũ khi
-nâng cấp từ 0.1.x: [`USAGE.md`](USAGE.md) §7.
+`shape` · `role` · `source` · `gate` · `qc` nằm trong khối `agent-meta` (gấp lại) — thứ agent và
+Orchestrator đọc, không phải thứ người xử lý. Nâng cấp từ bản cũ: `tasks-cli labels --migrate --apply`.
 
 ---
 
@@ -127,25 +124,11 @@ nâng cấp từ 0.1.x: [`USAGE.md`](USAGE.md) §7.
 
 ```
 /task-recap                       # skill, mặc định 7 ngày
-tasks_recap({ days: 30 })         # tool, trần 90
+tasks-cli recap --days 30         # người tự xem, không cần Claude
 ```
 
-Gộp **ba** nguồn: item trên tracker · `docs/releases/entries/` · `docs/knowledge/`. Trả về: đã land
-gì · **vì sao** (đánh đổi đã chốt) · nợ kỹ thuật còn mở · hành vi nào đã đổi · bài học đã ghi · việc
-đang ở đâu lúc này.
-
-Mục đáng đọc nhất là mục cuối — **"Chỗ KHÔNG có dấu vết"**: item đổi hành vi mà không khai đánh đổi ·
-item xong mà gate không xanh · fragment thiếu mục *Vì sao* · khối meta hỏng. Đó là danh sách việc
-phải đi hỏi, không phải nhiễu.
-
-⚠️ Đọc dòng **"Nguồn đã đọc"** trước khi tin bản recap: `KHÔNG ĐỌC ĐƯỢC` **≠** nguồn rỗng, và
-`KHÔNG truy vấn được nhãn debt` **≠** hết nợ.
-
-Người trong dự án tự xem được, không cần Claude:
-
-```bash
-tasks-cli recap --days 7          # exit 3 nếu có nguồn không đọc được
-```
+Gộp ba nguồn (item · `docs/releases/entries/` · `docs/knowledge/`): đã land gì · vì sao · nợ còn mở ·
+hành vi đã đổi · bài học · **đang ở cột nào** · **chỗ KHÔNG có dấu vết**. `KHÔNG ĐỌC ĐƯỢC` ≠ rỗng.
 
 ---
 
@@ -153,37 +136,17 @@ tasks-cli recap --days 7          # exit 3 nếu có nguồn không đọc đư�
 
 | Tệp | Trả lời |
 |---|---|
-| [`INSTALL.md`](INSTALL.md) | Cài thế nào — hai đường: marketplace, hoặc clone (chỉ khi bạn SỬA plugin) |
-| [`USAGE.md`](USAGE.md) | **Dùng hàng ngày**: 15 tool · 11 lệnh · các luồng thật · bảng nhãn · chẩn đoán |
-
----
-
-## Bản phát hành này chứa gì
-
-Chỉ **phần CHẠY**. Tài liệu thiết kế (vì sao claim dùng git ref, vì sao Free tier phải mô phỏng
-scoped label…) nằm ở repo phát triển — cố ý không đi kèm.
-
-Comment trong `plugin/lib/*.mjs` có những trích dẫn dạng `(docs/05 §3.4)`. Đó là **dẫn nguồn** tới
-tài liệu thiết kế nội bộ, ghi lại quyết định nào sinh ra dòng code đó — không phải link hỏng, và cố ý
-giữ để người bảo trì truy được. Mọi thứ **cần để dùng** plugin đều nằm trong `README` · `INSTALL` ·
-`USAGE` và trong chính mô tả của 15 tool.
-
-Kiểm bản đang có trong tay:
-
-```bash
-claude plugin validate ./plugin
-```
+| [`INSTALL.md`](INSTALL.md) | Cài thế nào — marketplace, hoặc clone khi bạn SỬA plugin |
+| [`USAGE.md`](USAGE.md) | **Dùng hàng ngày**: 15 tool · 11 lệnh · các luồng thật · điều kiện complete · chẩn đoán |
 
 ---
 
 ## Giới hạn đã biết, khai thẳng
 
-- **GitLab Free không loại trừ scoped label.** Server mô phỏng bằng một `PUT` mang cả
-  `remove_labels` lẫn `add_labels`. Đó là **mô phỏng, không phải bảo đảm** — nhưng chấp nhận được, vì
-  quyền làm việc do **claim ref** quyết định, nhãn chỉ là mặt hiển thị. Thấy hai `status::*` trên một
-  item ⇒ `tasks_doctor --fix`.
-- **Đóng Claude Code = ngừng heartbeat = claim hết hạn sau ≤ TTL.** Đó là hành vi ĐÚNG (máy tắt thì
-  việc nên quay lại hàng đợi), nhưng trong khoảng đó item vẫn hiện là `claimed`.
-- **Chưa nghiệm thu trên một GitLab instance thật ở mọi tier.** Lõi chỉ dùng tính năng Free nên chạy
-  được ở mọi tier; `tasks-cli probe --issue <iid nháp> --write` là lệnh chốt câu đó cho instance của
-  bạn.
+- **GitLab Free không loại trừ scoped label.** Server mô phỏng bằng một `PUT` mang cả `remove_labels`
+  lẫn `add_labels`. Quyền làm việc do **claim ref** quyết định, nhãn chỉ là mặt hiển thị. Thấy hai
+  `status::*` trên một item ⇒ `tasks_doctor --fix`.
+- **Đóng Claude Code = ngừng heartbeat = claim hết hạn sau ≤ TTL.** Việc quay lại Backlog — đúng.
+- **Assignee trên card cần user id thật.** Group token là bot nên server không assign; khối "Đang làm"
+  vẫn ghi đủ. Muốn avatar: `AGENT_TASKS_GITLAB_USER_ID`.
+- **Free tier: một issue board mỗi project.** `board --apply` dùng lại board đang có.

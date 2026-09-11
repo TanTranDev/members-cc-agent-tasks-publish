@@ -77,7 +77,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
     {
       uri: 'gitlab://work-items/ready',
       name: 'Hàng đợi việc đang chờ',
-      description: 'Danh sách work item status::ready.',
+      description: 'Danh sách work item ở cột Backlog (status::backlog) — chưa ai nhận.',
       mimeType: 'application/json',
     },
   ];
@@ -102,8 +102,8 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
 server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
   const uri = req.params.uri;
 
-  if (uri === 'gitlab://work-items/ready') {
-    const r = await runtime.handlers.tasks_list({ status: 'ready', limit: 100 });
+  if (uri === 'gitlab://work-items/ready' || uri === 'gitlab://work-items/backlog') {
+    const r = await runtime.handlers.tasks_list({ status: 'backlog', limit: 100 });
     return {
       contents: [{
         uri, mimeType: 'application/json',

@@ -46,6 +46,24 @@ export const BRIEF_MARKER = 'agent-tasks:brief';
 export const OUTCOME_MARKER = 'agent-tasks:outcome';
 
 /**
+ * Khối "Đang làm" (v0.3) — AI đang giữ item, trên máy nào, agent nào, tới bao giờ. Nằm ở ĐẦU
+ * description để người mở item thấy ngay, không phải cuộn. Ghi ở mọi lượt claim/nhả.
+ */
+export const WHO_MARKER = 'agent-tasks:who';
+
+/**
+ * Khối "Yêu cầu" (v0.3) — bản NGƯỜI đọc của một yêu cầu sau khi agent đã phỏng vấn: mục tiêu ·
+ * phạm vi · tiêu chí hoàn thành. Thay cho việc dán nguyên văn câu chat làm description.
+ */
+export const REQUEST_MARKER = 'agent-tasks:request';
+
+/**
+ * Khối "Cần bạn" (v0.3) — vì sao item nằm ở cột Needs you và người phải làm gì. Ghi bởi
+ * `task_block` và `task_report_progress kind=question`; xoá khi item đi tiếp.
+ */
+export const NEEDS_MARKER = 'agent-tasks:needs';
+
+/**
  * Nhận diện marker mở của khối agent-meta.
  * PHẢI khoan dung ngang BLOCK_RE trong lib/schema.mjs — xem lỗi #2 ở đầu file.
  */
@@ -130,18 +148,37 @@ export function readBlock(text, marker) {
 }
 
 /**
+ * Xoá hẳn một khối (cả marker). Không có ⇒ trả nguyên văn. Dùng khi khối "Cần bạn" hết lý do
+ * tồn tại — để lại khối rỗng thì người đọc tưởng vẫn còn việc phải làm.
+ */
+export function removeBlock(text, marker) {
+  const s = String(text ?? '');
+  const found = locate(s, marker);
+  if (!found) return s;
+  return (s.slice(0, found.start).trimEnd() + '\n\n' + s.slice(found.end).replace(/^\n+/, '')).replace(/^\n+/, '');
+}
+
+/**
  * Chèn khối mới hoặc thay khối cũ. Trả chuỗi MỚI, không đột biến đầu vào.
  *
  * Chèn mới thì đặt ở cuối phần người viết nhưng **TRƯỚC** khối agent-meta nếu có — vì
  * `writeAgentMeta` cắt bỏ mọi thứ nằm sau khối meta (xem lỗi #2 ở đầu file).
+ *
+ * `position: 'top'` ⇒ chèn mới ở ĐẦU description (khối "Đang làm", "Cần bạn" — thứ người phải
+ * thấy trước khi đọc gì khác). Đã có khối thì thay tại chỗ, không di chuyển: người có thể đã
+ * sắp lại thứ tự theo ý họ.
  */
-export function upsertBlock(text, marker, body) {
+export function upsertBlock(text, marker, body, { position = 'bottom' } = {}) {
   const s = String(text ?? '');
   const block = `${startOf(marker)}\n${sanitizeBody(body)}\n${endOf(marker)}`;
   const found = locate(s, marker);
 
   if (found) {
     return s.slice(0, found.start) + block + s.slice(found.end);
+  }
+
+  if (position === 'top') {
+    return s.trim() ? `${block}\n\n${s.replace(/^\n+/, '')}` : `${block}\n`;
   }
 
   const metaAt = s.search(META_START_RE);

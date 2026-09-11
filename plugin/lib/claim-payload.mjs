@@ -23,6 +23,8 @@ export function buildPayload({ identity, ownerId, itemKey, ref, ttlSec, previous
     session_id: identity.sessionId,
     pid: identity.pid,
     agent_role: identity.agentRole ?? null,
+    /** v0.3: tên agent cho khối "Đang làm" và card — một máy chạy nhiều agent thì vai không đủ phân biệt. */
+    agent_name: identity.agentName ?? null,
     acquired_at: previous?.acquired_at ?? new Date(t).toISOString(),
     renewed_at: previous ? new Date(t).toISOString() : null,
     expires_at: new Date(t + ttlSec * 1000).toISOString(),

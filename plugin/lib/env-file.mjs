@@ -26,6 +26,8 @@ export const ENV_MAP = Object.freeze({
   AGENT_TASKS_ENABLED: { key: 'enabled', path: ['enabled'], type: 'bool' },
   AGENT_TASKS_GITLAB_HOST: { key: 'gitlabHost', path: ['gitlabHost'], type: 'string' },
   AGENT_TASKS_PROJECT_PATH: { key: 'projectPath', path: ['projectPath'], type: 'string' },
+  /** v0.3: URL project GitLab chứa issue board — suy ra gitlabHost + projectPath khi hai khoá kia trống. */
+  AGENT_TASKS_BOARD_URL: { key: 'boardUrl', path: ['boardUrl'], type: 'string' },
   AGENT_TASKS_CLAIM_REPO_URL: { key: 'claimRepoUrl', path: ['claimRepoUrl'], type: 'string' },
   AGENT_TASKS_PROJECT_KEY: { key: 'projectKey', path: ['projectKey'], type: 'string' },
   AGENT_TASKS_REF_NAMESPACE: { key: 'refNamespace', path: ['refNamespace'], type: 'string' },

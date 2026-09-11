@@ -6,7 +6,7 @@
 
 import crypto from 'node:crypto';
 
-import { writeAgentMeta, META_VERSION } from '../schema.mjs';
+import { writeAgentMeta, parseLabels, META_VERSION } from '../schema.mjs';
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 
@@ -58,14 +58,14 @@ export function planIngest(sources, existing) {
       continue;
     }
 
-    const status = (item.labels ?? []).find((l) => l.startsWith('status::'))?.slice(8);
-    if (status === 'claimed') {
+    const status = parseLabels(item.labels ?? []).scoped.status;
+    if (status === 'working') {
       // KHÔNG ghi đè. Ai đó đang đọc chính description này.
       plan.push({
         action: 'WARN_DRIFT',
         key, hash, iid: item.iid, source: s,
         note:
-          `Nguồn đã đổi nhưng item #${item.iid} đang có người giữ (status::claimed) — ` +
+          `Nguồn đã đổi nhưng item #${item.iid} đang có người giữ (Working) — ` +
           `không ghi đè. Gắn nhãn source-drifted và ghi note để chủ claim tự quyết.`,
       });
       continue;
@@ -112,7 +112,6 @@ export function renderItem(source, { runId } = {}) {
     spec_delta: [],
     risk_declared: null,
     review_required: false,
-    observe: 'l0',
     ingest_run: runId ?? null,
     links: source.links ?? {},
     history: [],

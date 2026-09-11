@@ -1,7 +1,7 @@
 {
   "name": "agent-tasks",
-  "version": "0.2.1",
-  "description": "Điều phối công việc cho nhiều phiên agent qua GitLab work items: chống trùng task bằng claim có TTL trên git refs, đưa brief/spec/changelog thành item, và giữ nhãn/trạng thái đủ để agent tự quyết đúng.",
+  "version": "0.3.0",
+  "description": "Board 5 cột human-first (Backlog · Working · Needs you · In review · Ready to merge) cho nhiều phiên agent trên GitLab: chống trùng task bằng claim có TTL trên git refs, hiện ai/máy/agent đang làm, bắt agent viết hướng dẫn QC, nợ kỹ thuật thành issue riêng.",
   "author": { "name": "nexa" },
   "keywords": ["gitlab", "work-items", "multi-session", "claim", "agent-loop"],
   "mcpServers": {

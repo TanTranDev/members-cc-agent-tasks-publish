@@ -2,8 +2,11 @@
 // Cấu hình nhiều tầng, dưới đè lên trên:
 //
 //   DEFAULTS
-//     ← ~/.agent-tasks/config.json        (CẤP MÁY — dùng chung mọi dự án: claimRepoUrl…)
-//     ← .claude/agent-tasks.config.json   (tuỳ chọn, commit được — cấu hình dùng chung của team)
+//     ← ~/.agent-tasks/config.json        (CẤP MÁY — bản cũ; v0.3 chỉ còn nên giữ token ở ~/.agent-tasks/.env)
+//     ← .claude/agent-tasks.config.json   (bản cũ, vẫn đọc — nhưng .claude/ hay là symlink dùng chung)
+//     ← agent-tasks.config.json Ở ROOT    ★ v0.3: CẤU HÌNH CỦA DỰ ÁN, commit được, cả team dùng chung.
+//                                          Khoá chính: boardUrl (project GitLab chứa issue board),
+//                                          claimRepoUrl, ttl. KHÔNG token.
 //     ← <git-dir>/agent-tasks-local.json  (tuỳ chọn, không commit — override một clone)
 //     ← ~/.agent-tasks/.env               (CẤP MÁY — GITLAB_TOKEN dùng chung)
 //     ← .env ở root dự án                 (tuỳ chọn — override một dự án)
@@ -12,9 +15,15 @@
 //          ↓
 //     DERIVE từ git remote — điền khoá CÒN TRỐNG sau khi đã áp hết các tầng trên
 //
-// ★ MỘT MÁY NHIỀU DỰ ÁN (spec 2026-08-13): thứ dùng chung (`claimRepoUrl`, token) khai MỘT LẦN ở
-// `~/.agent-tasks/`; thứ riêng từng dự án (`gitlabHost`, `projectPath`) ĐỌC từ `.git/config` của
-// chính dự án. Nên một dự án mới cần **0 file cấu hình**.
+// ★ v0.3 (docs/11 §C5): cấu hình SỐNG TRONG REPO — `agent-tasks.config.json` ở root, commit được.
+// Vì sao không để ở cấp máy: mỗi người cài lại phải khai lại, và hai máy lệch nhau là lệch im lặng
+// (claim ở hai claim-repo khác nhau = hết chống trùng). File trong repo thì cả team đọc CÙNG một
+// bản. Token là thứ duy nhất KHÔNG vào repo — nó ở `~/.agent-tasks/.env` hoặc `<git-dir>/agent-tasks.env`.
+//
+// `boardUrl` là cách khai "board nằm ở project nào" bằng MỘT URL người copy từ trình duyệt
+// (`https://git.x/grp/backlog`). Nó suy ra `gitlabHost` + `projectPath`; khai hai khoá kia tường
+// minh vẫn thắng. Không khai gì ⇒ vẫn đọc từ git remote như trước (fallback, không phải mặc định
+// được khuyến khích: board thường KHÔNG nằm ở repo code).
 //
 // ⚠️ Derive là FALLBACK CUỐI, KHÔNG phải một tầng. Đặt nó vào bất kỳ vị trí nào trong chuỗi tầng
 // cũng sai một chiều: trước tầng dự án thì cấp máy không override được; sau thì nó đè cả khai
@@ -34,13 +43,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { readEnvFile, applyEnvOverrides, ENV_MAP, SECRET_KEYS, isPlaceholder } from './env-file.mjs';
-import { readRemote } from './git-remote.mjs';
+import { readRemote, parseRemoteUrl } from './git-remote.mjs';
 
 /** Giá trị mặc định. Số TTL/heartbeat lấy từ docs/05 §6. */
 export const DEFAULTS = Object.freeze({
   enabled: true,
   gitlabHost: null,
   projectPath: null,
+  /** v0.3: URL project GitLab chứa issue board. Suy ra gitlabHost + projectPath khi hai khoá đó trống. */
+  boardUrl: null,
   claimRepoUrl: null,
   /** "auto" ⇒ derive từ projectPath. Hoặc một chuỗi tường minh. */
   projectKey: 'auto',
@@ -66,6 +77,8 @@ export const DEFAULTS = Object.freeze({
 });
 
 const PROJECT_REL = path.join('.claude', 'agent-tasks.config.json');
+/** v0.3: file cấu hình CHÍNH của dự án, ở root repo, commit được. */
+export const REPO_CONFIG_BASENAME = 'agent-tasks.config.json';
 const LOCAL_BASENAME = 'agent-tasks-local.json';
 const ENV_BASENAME = '.env';
 
@@ -422,6 +435,10 @@ export function loadConfig(opts = {}) {
     }
   }
 
+  // ★ v0.3 — tầng CỦA DỰ ÁN, thắng cấp máy và thắng `.claude/`. Đây là file tài liệu hướng người
+  // dùng tới; hai tầng trên chỉ còn để không vỡ bản cũ.
+  applyLayer('repo', root ? path.join(root, REPO_CONFIG_BASENAME) : null);
+
   applyLayer('local', gitDir ? path.join(gitDir, LOCAL_BASENAME) : null);
 
   /**
@@ -526,6 +543,43 @@ export function loadConfig(opts = {}) {
   const envApplied = applyEnvOverrides(merged, effectiveEnv);
   merged = envApplied.config;
   warnings.push(...envApplied.warnings);
+
+  // ── boardUrl → gitlabHost + projectPath (v0.3) ─────────────────────────────
+  // Một URL người copy từ trình duyệt, thay cho hai khoá phải gõ đúng. Chỉ điền khoá CÒN TRỐNG:
+  // ai khai gitlabHost/projectPath tường minh thì vẫn thắng.
+  if (merged.boardUrl) {
+    // URL copy từ trình duyệt hay kèm đuôi `/-/boards/42`, `/-/issues`: `/-/` là ranh giới GitLab đặt
+    // giữa project path và trang. Cắt ở đó, không thì projectPath mang rác và mọi lời gọi API 404.
+    const cleaned = String(merged.boardUrl).replace(/\/-\/.*$/, '').replace(/[?#].*$/, '');
+    const b = parseRemoteUrl(cleaned);
+    if (!b) {
+      warnings.push(
+        `boardUrl "${merged.boardUrl}" không nhận dạng được — cần dạng https://<host>/<group>/<project>. ` +
+          'Bỏ qua khoá này.',
+      );
+      hardFail = true;
+    } else {
+      const scheme = /^http:\/\//i.test(String(merged.boardUrl)) ? 'http' : 'https';
+      /** @type {string[]} */ const filled = [];
+      if (!merged.gitlabHost) {
+        merged.gitlabHost = `${scheme}://${b.host}`;
+        filled.push('gitlabHost');
+      }
+      if (!merged.projectPath) {
+        merged.projectPath = b.projectPath;
+        filled.push('projectPath');
+      }
+      sources.push({ layer: 'boardUrl', path: null, loaded: true, filled });
+      // Khai cả boardUrl lẫn projectPath mà hai cái nói hai project khác nhau ⇒ nói ra: một trong hai
+      // là thừa hoặc sai, và work item sẽ đi vào project mà người đọc file không ngờ tới.
+      if (!filled.includes('projectPath') && merged.projectPath !== b.projectPath) {
+        warnings.push(
+          `⚠️ boardUrl trỏ tới "${b.projectPath}" nhưng projectPath khai là "${merged.projectPath}" — ` +
+            'projectPath THẮNG. Bỏ một trong hai để khỏi lệch.',
+        );
+      }
+    }
+  }
 
   // ── DERIVE từ git remote — FALLBACK CUỐI, không phải một tầng ─────────────
   // Chỉ điền khoá CÒN TRỐNG sau khi đã áp hết mọi tầng, nên mọi khai tường minh đều thắng.
@@ -672,17 +726,17 @@ export function loadConfig(opts = {}) {
     const needProject = missing.filter((k) => !MACHINE_KEYS.includes(k));
 
     const parts = [`Thiếu ${missing.join(', ')} — chưa cấu hình.`];
+    const repoFile = root ? path.join(root, REPO_CONFIG_BASENAME) : REPO_CONFIG_BASENAME;
     if (needMachine.length) {
       parts.push(
-        `${needMachine.join(', ')} là cấu hình DÙNG CHUNG cả máy: chạy \`tasks-cli setup\` rồi điền ` +
-          `vào ${path.join(mDir, 'config.json')}.`,
+        `${needMachine.join(', ')} khai trong ${repoFile} (chạy \`tasks-cli init\` để sinh file; ` +
+          `commit cho cả team). Bản cũ để ở ${path.join(mDir, 'config.json')} vẫn được đọc.`,
       );
     }
     if (needProject.length) {
       parts.push(
-        `${needProject.join(', ')} bình thường được suy từ git remote của dự án — xem warnings để ` +
-          `biết vì sao không suy được. Hoặc khai tường minh ${envNamesFor(needProject)} vào ` +
-          `${ENV_BASENAME} ở root dự án.`,
+        `${needProject.join(', ')} suy từ \`boardUrl\` trong ${repoFile} (URL project GitLab chứa ` +
+          `issue board), hoặc từ git remote của dự án — xem warnings để biết vì sao không suy được.`,
       );
     }
     parts.push('Trong lúc chưa cấu hình, mọi tool sẽ báo lỗi có hướng dẫn thay vì hoạt động sai.');
@@ -690,9 +744,9 @@ export function loadConfig(opts = {}) {
   } else if (placeholders.length) {
     reason =
       `Cấu hình vẫn còn GIÁ TRỊ MẪU ở ${placeholders.join(', ')} — chưa điền giá trị thật. ` +
-      `Sửa ${envNamesFor(placeholders)} (cấp máy: ${path.join(mDir, 'config.json')} · dự án: ` +
-      `${ENV_BASENAME}) thành giá trị GitLab của bạn. Đây là bản mẫu do \`tasks-cli setup\`/\`init\` ` +
-      `copy ra, không phải cấu hình.`;
+      `Sửa trong ${root ? path.join(root, REPO_CONFIG_BASENAME) : REPO_CONFIG_BASENAME} ` +
+      `(hoặc biến ${envNamesFor(placeholders)}) thành giá trị GitLab của bạn. Đây là bản mẫu do ` +
+      `\`tasks-cli init\`/\`setup\` sinh ra, không phải cấu hình.`;
   }
 
   delete merged.token;

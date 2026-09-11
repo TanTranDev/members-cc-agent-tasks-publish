@@ -77,6 +77,6 @@ pipeline phải biết bản này chưa đầy đủ. Nhắc đường CLI này 
 ## Mục "Vì sao" trống thì đó là một PHÁT HIỆN, không phải một mục nhàm
 
 `tradeoff` chỉ vào được item qua `task_complete` (xem skill `task-finish`), và server chỉ **BẮT BUỘC**
-nó ở hai ca: `care::chat` và `review::required`. Nên mục *Vì sao* trống ở một item đổi hành vi nghĩa
+nó ở hai ca: `careful` và `review::required`. Nên mục *Vì sao* trống ở một item đổi hành vi nghĩa
 là **ai đó đã land một thay đổi mà không ghi lại quyết định** — recap liệt kê đúng những iid đó ở
 mục *Chỗ KHÔNG có dấu vết*. Chuyển nguyên danh sách iid ấy: nó là việc phải đi hỏi, không phải nhiễu.

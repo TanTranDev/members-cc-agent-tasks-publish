@@ -12,8 +12,9 @@ import { execFileSync } from 'node:child_process';
 
 import { createRuntime } from '../lib/runtime.mjs';
 import { createIngestRunner } from '../lib/ingest/run.mjs';
-import { labelDefinitions, RETIRED_LABELS } from '../lib/schema.mjs';
-import { findRepoRoot, claudeDirIsShared, CLONE_ENV_BASENAME } from '../lib/config.mjs';
+import { labelDefinitions, RETIRED_LABELS, STATUS, STATUS_HUMAN, migrationPlan } from '../lib/schema.mjs';
+import { findRepoRoot, claudeDirIsShared, CLONE_ENV_BASENAME, REPO_CONFIG_BASENAME } from '../lib/config.mjs';
+import { planBoard, applyBoard } from '../lib/board.mjs';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -26,28 +27,33 @@ const value = (name, def = null) => {
 
 const USAGE = `agent-tasks CLI
 
-  tasks-cli setup [--force]   MỘT LẦN CHO CẢ MÁY: tạo ~/.agent-tasks/{config.json,.env}
-  tasks-cli init [--force]    TUỲ CHỌN, chỉ khi một dự án cần cấu hình khác cấp máy
+  tasks-cli init [--force]    TẠO agent-tasks.config.json ở ROOT REPO (commit được, cả team dùng):
+                              boardUrl (project GitLab chứa issue board) + claimRepoUrl + ttl
+  tasks-cli setup [--force]   MỘT LẦN CHO CẢ MÁY: ~/.agent-tasks/.env chứa GITLAB_TOKEN (không vào repo)
   tasks-cli init --local [--force]
-                              cấu hình của RIÊNG clone này vào <git-dir>/agent-tasks.env
-                              (không commit được, không đụng .env của dự án)
+                              override của RIÊNG clone này vào <git-dir>/agent-tasks.env
+                              (token riêng, board riêng — không commit được)
   tasks-cli status            trạng thái cấu hình + claim của phiên này
   tasks-cli verify            kiểm 3 tiền đề: cấu hình · SSH claim-repo · token GitLab
+  tasks-cli labels [--apply]  tạo bộ nhãn v0.3 trên project chứa board (10 nhãn; mặc định chỉ in ra)
+  tasks-cli labels --migrate [--apply]
+                              đổi nhãn v0.2 trên item đang mở sang v0.3 (ready→backlog, claimed→working,
+                              blocked→needs-you, review→in-review, care::chat→careful; gỡ gate::/needs-advice/spec-changed)
+  tasks-cli labels --prune [--apply]
+                              xoá các nhãn ĐÃ NGHỈ khỏi project. Không --apply thì chỉ liệt kê
+  tasks-cli board [--apply]   dựng issue board 5 cột: Backlog · Working · Needs you · In review · Ready to merge
+  tasks-cli doctor [--fix]    chẩn đoán lệch giữa claim ref và nhãn GitLab, nhãn v0.2 chưa dọn
+  tasks-cli claims [--all]    claim đang sống; --all = mọi dự án trên claim-repo này
   tasks-cli probe [--issue <iid>] [--write]
                               dò năng lực instance (version, tier, scoped label…)
-  tasks-cli doctor [--fix]    chẩn đoán lệch giữa claim ref và nhãn GitLab
-  tasks-cli claims [--all]    claim đang sống; --all = mọi dự án trên claim-repo này
-  tasks-cli labels [--apply]  tạo bộ nhãn trên project (13 nhãn; mặc định chỉ in ra)
-  tasks-cli labels --prune [--apply]
-                              xoá các nhãn ĐÃ NGHỈ ở v0.2 (44 → 13). Không --apply thì chỉ liệt kê
   tasks-cli recap [--days 7] [--json]
                               N ngày qua: đã land gì · VÌ SAO · nợ kỹ thuật · bài học · đang ở đâu
   tasks-cli ingest [--apply] [--source spec|changelog|brief]
                               nhập tài liệu thành work item (MẶC ĐỊNH dry-run)
 
-Một máy nhiều dự án: thứ DÙNG CHUNG (claim-repo, token) khai một lần ở
-~/.agent-tasks/; còn gitlabHost + projectPath được ĐỌC từ git remote của từng dự án.
-Nên một dự án mới KHÔNG cần file cấu hình nào. Khai tường minh vẫn luôn thắng.
+Cấu hình sống TRONG REPO (agent-tasks.config.json) để cả team đọc cùng một bản. Chỉ token ở ngoài
+(~/.agent-tasks/.env). Không khai boardUrl ⇒ đọc git remote của repo — nhưng board thường KHÔNG
+nằm ở repo code, nên hãy khai.
 `;
 
 function requireReady(rt) {
@@ -118,11 +124,11 @@ switch (cmd) {
       console.log(`✓ đã tạo ${envFile} (quyền 600)`);
     }
 
-    console.log('\nHai giá trị PHẢI điền:');
-    console.log(`  claimRepoUrl   trong ${cfgFile}`);
+    console.log('\nPhải điền:');
     console.log(`  GITLAB_TOKEN   trong ${envFile}  (group access token, scope api)`);
-    console.log('\nĐiền xong chạy: node bin/tasks-cli.mjs verify');
-    console.log('Sau đó MỌI dự án trên máy dùng được, không cần cấu hình riêng.');
+    console.log(`  claimRepoUrl   NÊN khai trong agent-tasks.config.json của TỪNG REPO (tasks-cli init) — cả team`);
+    console.log(`                 dùng chung một bản. ${cfgFile} chỉ là fallback cấp máy.`);
+    console.log('\nĐiền xong, vào repo dự án chạy: node bin/tasks-cli.mjs init  rồi  verify');
     break;
   }
 
@@ -228,69 +234,46 @@ GITLAB_TOKEN=
       break;
     }
 
-    const dest = path.join(root, '.env');
-    const sample = path.join(PKG_ROOT, '.env.example');
-
+    // ── `init` (mặc định, v0.3): agent-tasks.config.json ở ROOT REPO — file của DỰ ÁN, commit được.
+    //
+    // Vì sao JSON trong repo chứ không .env: .env là của máy (token), còn "board ở project nào,
+    // claim-repo nào" là sự thật của DỰ ÁN — mỗi người khai lại một bản là mỗi người một sự thật.
+    const dest = path.join(root, REPO_CONFIG_BASENAME);
     if (fs.existsSync(dest) && !flag('force')) {
-      console.log(`.env đã tồn tại: ${dest}`);
+      console.log(`${REPO_CONFIG_BASENAME} đã tồn tại: ${dest}`);
       console.log('Không ghi đè (thêm --force nếu thật sự muốn thay).');
       console.log('\nSửa tay rồi chạy: node bin/tasks-cli.mjs verify');
       break;
     }
-
-    let tpl;
-    try {
-      tpl = fs.readFileSync(sample, 'utf8');
-    } catch {
-      console.error(`✗ không đọc được bản mẫu ${sample} — cài đặt package bị thiếu file?`);
-      process.exitCode = 2;
-      break;
-    }
-
-    // Bảo vệ secret TRƯỚC khi ghi file có token: .env (và mọi biến thể) phải được gitignore.
-    // Thứ tự quan trọng — ghi token ra đĩa rồi mới ignore là để hở một khoảng.
-    const giPath = path.join(root, '.gitignore');
-    let gi = '';
-    try {
-      gi = fs.readFileSync(giPath, 'utf8');
-    } catch {
-      /* chưa có .gitignore */
-    }
-    const lines = gi.split(/\r?\n/).map((l) => l.trim());
-    // `.env` trần KHÔNG phủ `.env.bak` — nên phải kiểm riêng, đừng coi là xong.
-    const envCovered = lines.some((l) => ['.env', '.env*', '*.env', '/.env'].includes(l));
-    const bakCovered = lines.some((l) => ['.env*', '*.env', '.env.bak', '.env.*'].includes(l));
-
-    if (!envCovered || !bakCovered) {
-      fs.appendFileSync(
-        giPath,
-        `${gi && !gi.endsWith('\n') ? '\n' : ''}\n` +
-          '# Cấu hình + token của từng máy — không commit.\n' +
-          '# `.env*` phủ cả .env.bak (do `init --force` tạo) và .env.local.\n' +
-          '.env*\n' +
-          '!.env.example\n',
-      );
-      console.log(`✓ đã thêm \`.env*\` vào ${giPath} (các file này chứa token, không được commit)`);
-    }
-
     if (fs.existsSync(dest) && flag('force')) {
-      // Ghi đè cấu hình có token là mất dữ liệu thật. Giữ lại một bản — cũng quyền 600,
-      // vì nó chứa đúng cái token vừa bị thay.
-      const backup = `${dest}.bak`;
-      fs.copyFileSync(dest, backup);
-      fs.chmodSync(backup, 0o600);
-      console.log(`↩ đã lưu bản cũ: ${backup}`);
+      fs.copyFileSync(dest, `${dest}.bak`);
+      console.log(`↩ đã lưu bản cũ: ${dest}.bak`);
     }
 
-    fs.writeFileSync(dest, tpl, { mode: 0o600 });
-    console.log(`✓ đã tạo ${dest} (quyền 600 — chỉ chủ máy đọc được)`);
-
-    console.log('\nBa dòng BẮT BUỘC phải điền trong .env:');
-    console.log('  AGENT_TASKS_GITLAB_HOST      https://git.example.inc');
-    console.log('  AGENT_TASKS_PROJECT_PATH     grp/agent-backlog');
-    console.log('  AGENT_TASKS_CLAIM_REPO_URL   git@git.example.inc:grp/agent-claims.git');
-    console.log('  GITLAB_TOKEN                 group access token, scope api');
-    console.log('\nĐiền xong chạy: node bin/tasks-cli.mjs verify');
+    // Điền sẵn thứ đang suy được để người sửa ÍT nhất — nhưng boardUrl từ remote chỉ là GỢI Ý:
+    // board thường không nằm ở repo code.
+    const guessHost = rt.config?.gitlabHost ?? 'https://git.example.inc';
+    const guessPath = rt.config?.projectPath ?? 'grp/agent-board';
+    const guessClaim = rt.config?.claimRepoUrl ?? 'git@git.example.inc:grp/agent-claims.git';
+    const body = {
+      _doc: [
+        'agent-tasks — cấu hình CỦA DỰ ÁN, commit file này. KHÔNG bao giờ để token ở đây.',
+        'boardUrl: URL project GitLab chứa ISSUE BOARD (copy từ trình duyệt). Không nhất thiết là repo code này.',
+        'claimRepoUrl: repo git chỉ để giữ khoá claim (SSH). Dùng chung được cho nhiều dự án.',
+        'Token: ~/.agent-tasks/.env (tasks-cli setup) hoặc <git-dir>/agent-tasks.env (tasks-cli init --local).',
+        'Kiểm: tasks-cli verify · tạo nhãn: tasks-cli labels --apply · dựng board: tasks-cli board --apply',
+      ],
+      boardUrl: `${guessHost.replace(/\/$/, '')}/${guessPath}`,
+      claimRepoUrl: guessClaim,
+      ttlSec: 1800,
+      heartbeatSec: 600,
+    };
+    fs.writeFileSync(dest, `${JSON.stringify(body, null, 2)}\n`);
+    console.log(`✓ đã tạo ${dest}`);
+    console.log(`    boardUrl      ${body.boardUrl}   ← ${rt.config?.projectPath ? 'suy từ git remote — SỬA nếu board ở project khác' : 'GIÁ TRỊ MẪU, phải sửa'}`);
+    console.log(`    claimRepoUrl  ${body.claimRepoUrl}   ← ${rt.config?.claimRepoUrl ? 'đang dùng' : 'GIÁ TRỊ MẪU, phải sửa'}`);
+    console.log('\nToken KHÔNG nằm trong file này: node bin/tasks-cli.mjs setup  (một lần cho cả máy)');
+    console.log('Điền xong chạy: node bin/tasks-cli.mjs verify → labels --apply → board --apply');
     break;
   }
 
@@ -312,8 +295,13 @@ GITLAB_TOKEN=
     // API thật nên 404/401 sẽ lộ. Người đọc cần thấy hai giá trị đến từ hai nguồn để hiểu vì sao.
     {
       const src = (rt.sources ?? []).find((s) => s.layer === 'git-remote');
+      const board = (rt.sources ?? []).find((s) => s.layer === 'boardUrl');
       const from = (key) =>
-        src?.filled?.includes(key) ? `git remote "${src.remote}"` : 'khai tường minh';
+        board?.filled?.includes(key)
+          ? `boardUrl "${rt.config?.boardUrl}"`
+          : src?.filled?.includes(key)
+            ? `git remote "${src.remote}"`
+            : 'khai tường minh';
       console.log(`  gitlab     ${rt.config?.gitlabHost ?? '-'}   ← ${from('gitlabHost')}`);
       console.log(`  project    ${rt.config?.projectPath ?? '-'}   ← ${from('projectPath')}`);
     }
@@ -374,7 +362,7 @@ GITLAB_TOKEN=
       console.log(`\n✗ còn ${bad} việc phải sửa trước khi chạy labels/ingest.`);
       process.exitCode = 2;
     } else {
-      console.log('\n✓ sẵn sàng. Bước kế: node bin/tasks-cli.mjs labels --apply');
+      console.log('\n✓ sẵn sàng. Bước kế: node bin/tasks-cli.mjs labels --apply  rồi  board --apply');
     }
     break;
   }
@@ -382,6 +370,7 @@ GITLAB_TOKEN=
   case 'status': {
     console.log(`root:        ${rt.root ?? '(không xác định)'}`);
     console.log(`cấu hình:    ${rt.configured ? '✓ sẵn sàng' : `✗ ${rt.reason}`}`);
+    console.log(`board:       ${rt.config?.boardUrl ?? '(không khai — đọc từ git remote)'}`);
     console.log(`gitlab:      ${rt.config?.gitlabHost ?? '-'} / ${rt.config?.projectPath ?? '-'}`);
     console.log(`claim-repo:  ${rt.config?.claimRepoUrl ?? '-'}`);
     console.log(`projectKey:  ${rt.config?.projectKey ?? '-'}`);
@@ -507,6 +496,44 @@ GITLAB_TOKEN=
   case 'labels': {
     const defs = labelDefinitions();
 
+    // `--migrate`: đổi nhãn v0.2 trên ITEM ĐANG MỞ sang v0.3. Item đã đóng để yên — lịch sử là
+    // lịch sử, và không ai lọc board theo item đóng.
+    if (flag('migrate')) {
+      if (!requireReady(rt)) break;
+      const opened = await rt.gitlab.listAllIssues({ state: 'opened', perPage: 100 });
+      const plans = opened
+        .map((i) => ({ iid: i.iid, title: i.title, ...migrationPlan(i.labels ?? []) }))
+        .filter((p) => !p.noop);
+      if (!plans.length) {
+        console.log(`✓ ${opened.length} item đang mở đều đã mang nhãn v0.3.`);
+        break;
+      }
+      console.log(`${plans.length}/${opened.length} item đang mở còn nhãn v0.2${flag('apply') ? '' : ' (chỉ xem — thêm --apply để đổi thật)'}:\n`);
+      for (const p of plans) {
+        console.log(`  #${p.iid} ${String(p.title ?? '').slice(0, 50)}`);
+        if (p.remove.length) console.log(`      − ${p.remove.join(', ')}`);
+        if (p.add.length) console.log(`      + ${p.add.join(', ')}`);
+      }
+      if (!flag('apply')) break;
+      // Tạo nhãn mới trước — gắn nhãn chưa tồn tại thì GitLab tự tạo với màu ngẫu nhiên.
+      for (const d of defs) await rt.gitlab.createLabel(d);
+      let done = 0;
+      for (const p of plans) {
+        try {
+          await rt.gitlab.updateIssue(p.iid, {
+            ...(p.add.length ? { add_labels: p.add.join(',') } : {}),
+            ...(p.remove.length ? { remove_labels: p.remove.join(',') } : {}),
+          });
+          done++;
+        } catch (err) {
+          console.error(`  ✗ #${p.iid}: ${err.message}`);
+          process.exitCode = 2;
+        }
+      }
+      console.log(`\n✓ đã đổi ${done}/${plans.length} item. Dọn tên nhãn cũ khỏi project: tasks-cli labels --prune --apply`);
+      break;
+    }
+
     // `--prune` là đường DỌN sau khi bộ nhãn xuống 44 → 13 ở v0.2. Nó xoá theo DANH SÁCH TƯỜNG
     // MINH `RETIRED_LABELS`, không xoá "mọi nhãn không nằm trong bộ mới": project của người ta có
     // nhãn riêng của họ (`ưu tiên::cao`, tên sprint, tên team), và xoá theo phép trừ là xoá cả
@@ -556,8 +583,33 @@ GITLAB_TOKEN=
       r.existed ? existed++ : created++;
     }
     console.log(`✓ tạo mới ${created}, đã có sẵn ${existed}.`);
-    console.log(`\nBộ nhãn v0.2 có 13 nhãn. Project nâng cấp từ 0.1.x còn ${RETIRED_LABELS.length} tên đã nghỉ —`);
-    console.log('dọn bằng: tasks-cli labels --prune   (xem trước), rồi --prune --apply');
+    console.log('\nBộ nhãn v0.3 có 10 nhãn: 5 cột + 5 hành động của người. Project nâng cấp từ bản cũ:');
+    console.log('  tasks-cli labels --migrate --apply   đổi nhãn trên item đang mở');
+    console.log('  tasks-cli labels --prune --apply     xoá tên nhãn đã nghỉ khỏi project');
+    console.log('  tasks-cli board --apply              dựng 5 cột trên issue board');
+    break;
+  }
+
+  // Board 5 cột cho NGƯỜI — một lần mỗi project. Free tier: MỘT board/project, nên dùng lại board
+  // đang có thay vì đòi tạo board mới (tạo thêm sẽ 403/422).
+  case 'board': {
+    if (!requireReady(rt)) break;
+    if (!flag('apply')) {
+      console.log('Sẽ dựng issue board với 5 cột (thêm --apply để ghi thật):\n');
+      for (const c of planBoard()) console.log(`  ${c.column.padEnd(15)} ← nhãn ${c.label}`);
+      console.log(`\nMở board: ${rt.config.gitlabHost}/${rt.config.projectPath}/-/boards`);
+      break;
+    }
+    try {
+      const r = await applyBoard(rt.gitlab);
+      console.log(`${r.board.created ? '✓ tạo' : '▸ dùng'} board "${r.board.name}" (#${r.board.id})`);
+      console.log(`✓ cột: thêm ${r.added.length}, đã có ${r.existed.length}.`);
+      console.log(`\nMở board: ${rt.config.gitlabHost}/${rt.config.projectPath}/-/boards/${r.board.id}`);
+      console.log('Thứ tự cột kéo tay trên UI nếu chưa đúng: Backlog · Working · Needs you · In review · Ready to merge.');
+    } catch (err) {
+      console.error(`✗ ${err.message}`);
+      process.exitCode = 2;
+    }
     break;
   }
 
